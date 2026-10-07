@@ -69,6 +69,9 @@ const usage_fmt =
     \\  -f, --force      Skip confirmation for destructive actions (overwrite, erase)
     \\  --part <name>    Target device for flash (e.g. mc9s08jm60); --flash-base overrides
     \\  --bus-hz <n>     Target bus clock for flash timing (else measured)
+    \\  --trim <kHz>     HCS08 ICS parts: trim the internal reference to this frequency
+    \\                   (e.g. 33.6) and program the result; needs --part
+    \\  --nvloc <a>      Where the trim bytes live (default: from the clock type, 0xFFAE)
     \\  --no-verify      Skip the post-program verify pass
     \\  --sim            Run against a software virtual target (no hardware needed)
     \\  --json           Machine-readable output for list/parts/status/regs/read
@@ -95,6 +98,8 @@ const Flags = struct {
     force: bool = false,
     part: ?[]const u8 = null,
     bus_hz: ?u32 = null,
+    trim_hz: ?u32 = null,
+    nvloc: ?u32 = null,
     flash_base: ?u16 = null,
     no_verify: bool = false,
     port: u16 = 1234,
@@ -231,6 +236,13 @@ fn parseFlags(arena: std.mem.Allocator, args: []const [:0]const u8) !Flags {
             f.part = nextValue(args, &i, "--part");
         } else if (eq(arg, "--bus-hz")) {
             f.bus_hz = parseInt(u32, nextValue(args, &i, "--bus-hz"), "bus frequency");
+        } else if (eq(arg, "--trim")) {
+            const v = nextValue(args, &i, "--trim");
+            const khz = std.fmt.parseFloat(f64, v) catch fatalCode(.usage, "invalid trim frequency: '{s}' (kHz, e.g. 33.6)", .{v});
+            if (!(khz > 0 and khz < 10_000)) fatalCode(.usage, "trim frequency {s} kHz is out of range", .{v});
+            f.trim_hz = @intFromFloat(@round(khz * 1000.0));
+        } else if (eq(arg, "--nvloc")) {
+            f.nvloc = parseInt(u32, nextValue(args, &i, "--nvloc"), "trim location");
         } else if (eq(arg, "--flash-base")) {
             f.flash_base = parseInt(u16, nextValue(args, &i, "--flash-base"), "flash base");
         } else if (eq(arg, "--sim")) {
@@ -871,8 +883,11 @@ fn cmdConnect(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
     const sync = try bdm.sess.getSpeedSync();
     if (sync != 0) {
         const hz = session.syncToHz(sync);
-        try out.print("  {s}bus speed{s}     {s}{s}{d}.{d:0>3} MHz{s}\n", .{
-            st.dim, st.reset, st.bold, st.green, hz / 1_000_000, (hz % 1_000_000) / 1000, st.reset,
+        // On HCS08 the pod measures the BDC clock: the bus only with CLKSW=1, otherwise the
+        // alternate clock (twice the bus on ICS parts).
+        const bus_label: []const u8 = if (flags.target == .hcs08 and ((bdm.sess.readStatusReg() catch 0x08) & 0x08 == 0)) "bdc clock" else "bus speed";
+        try out.print("  {s}{s}{s}     {s}{s}{d}.{d:0>3} MHz{s}\n", .{
+            st.dim, bus_label, st.reset, st.bold, st.green, hz / 1_000_000, (hz % 1_000_000) / 1000, st.reset,
         });
     }
     reportDetected(bdm, flags, out, st);
@@ -1554,12 +1569,15 @@ const FlashPrep = struct {
 
 /// Connect, measure bus clock, parse the routine blob. Caller builds the
 /// driver locally (target-pointer lifetime).
-fn prepareFlash(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) FlashPrep {
+fn prepareFlash(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style, image: ?*hexfile.Image, strict: bool) FlashPrep {
     const d = resolveDevice(flags);
     // HCS08/HCS12 controller base is a u16; CFV1 is u32 (sits high at 0xFF9820).
     if (d.family != .cfv1 and d.flash_base > 0xFFFF) {
         fatal("--part '{s}' has a flash controller base 0x{x} that doesn't fit the {s} routine's 16-bit field", .{ d.name, d.flash_base, @tagName(d.family) });
     }
+    if (d.family == .hcs08 and flags.target == .hcs08) return prepareHcs08(arena, bdm, flags, d, out, st, image, strict);
+    if (flags.trim_hz != null or flags.nvloc != null)
+        fatalCode(.usage, "--trim/--nvloc are implemented for HCS08 ICS parts only (got {s})", .{flags.target.name()});
     bringUp(bdm, flags) catch |err| fatal("connect failed: {s}", .{@errorName(err)});
     // HCS12: a target running its own code acks memory access but not a PC
     // write (BDM_RC_ACK_TIMEOUT), so the routine cannot be started. Reset into
@@ -1613,6 +1631,51 @@ fn initXmmcFlash(bdm: *Bdm, d: lib_device.Device, bus_hz: u32) void {
         bdm.sess.writeMem(.byte, w.addr, &.{w.val}) catch |err|
             fatal("XFTMRK flash init: write 0x{x:0>4} failed: {s}", .{ w.addr, @errorName(err) });
     }
+}
+
+/// HCS08: reset, COP, clock, optional trim and FCDIV before the routine may run (see
+/// hcs08.zig), then the same FlashPrep as any other part at the bus clock that was set up.
+fn prepareHcs08(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, d: lib_device.Device, out: *Io.Writer, st: tty.Style, image: ?*hexfile.Image, strict: bool) FlashPrep {
+    _ = bdm.sess.capabilities() catch {};
+    bdm.sess.setOptions(lib.hcs08.options(optionsForTarget(flags))) catch |err| fatal("connect failed: {s}", .{@errorName(err)});
+    bdm.sess.setTarget(flags.target) catch |err| fatal("connect failed: {s}", .{@errorName(err)});
+    bdm.sess.connectWithRetry(true) catch |err| fatal("connect failed: {s}", .{@errorName(err)});
+    var ctx = lib.hcs08.Ctx{ .sess = &bdm.sess, .dev = d, .sleep_ms = lib.hcs08.sleepMs };
+    const res = lib.hcs08.prepare(arena, &ctx, .{
+        .trim_hz = flags.trim_hz,
+        .nvloc = flags.nvloc,
+        .bus_hz = flags.bus_hz,
+        .strict = strict,
+    }, image) catch |err| switch (err) {
+        error.NoFlashDivider => fatal("no flash clock divider fits this bus clock (the flash needs 150-200 kHz); pass --bus-hz if the measurement is wrong", .{}),
+        error.FcdivNotLoaded => fatal("FCDIV did not load: it was already written since the last reset, so the target was not reset cleanly (the firmware ran before the halt)", .{}),
+        error.TrimNotSupported => fatal("--trim needs an HCS08 part with an ICS clock; pass --part (this device's clock is '{s}')", .{@tagName(d.clock)}),
+        error.BadTrimLocation => fatal("the trim location is not in {s} flash; check --nvloc", .{d.name}),
+        error.TrimOutOfRange => fatal("the clock cannot be trimmed to {d:.3} kHz: the search ran off the end of the trim range", .{@as(f64, @floatFromInt(flags.trim_hz orelse 0)) / 1000.0}),
+        else => fatal("HCS08 flash bring-up failed: {s}", .{@errorName(err)}),
+    };
+
+    out.print("{s}special reset, COP off, bus clock {d}.{d:0>3} MHz, FCDIV 0x{x:0>2}{s}\n", .{
+        st.dim, res.bus_hz / 1_000_000, (res.bus_hz % 1_000_000) / 1000, res.fcdiv | 0x80, st.reset,
+    }) catch {};
+    if (res.trim) |t| {
+        const tb = res.trim_bytes.?;
+        out.print("{s}trimmed{s} the reference to {d:.3} kHz: trim 0x{x:0>3} (TRIM 0x{x:0>2}, FTRIM {d}), {d} measurements; trim bytes 0x{x:0>4}={x:0>2} 0x{x:0>4}={x:0>2}\n", .{
+            st.green,     st.reset,      @as(f64, @floatFromInt(flags.trim_hz.?)) / 1000.0,
+            t.value,      t.value >> 1,  t.value & 1,
+            t.samples,    tb.ftrim_addr, tb.ftrim,
+            tb.trim_addr, tb.trim,
+        }) catch {};
+    }
+    if (res.preserved) |k| {
+        out.print("{s}kept the oscillator trim{s} {x:0>2} {x:0>2} at 0x{x:0>4} (the sector erase would have wiped it; --trim re-trims)\n", .{
+            st.green, st.reset, k[0], k[1], res.preserved_at,
+        }) catch {};
+    }
+    if (res.soft_error) |e| {
+        out.print("{s}warning:{s} HCS08 flash setup incomplete ({s}); continuing\n", .{ st.yellow, st.reset, @errorName(e) }) catch {};
+    }
+    return flashPrepFor(arena, d, res.bus_hz);
 }
 
 /// FlashPrep for a device at a known bus clock, no I/O (shared by prepareFlash + gdb).
@@ -1687,7 +1750,7 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
     const path = flags.positionals[1];
     const bytes = Io.Dir.cwd().readFileAlloc(global_io, path, arena, .limited(16 * 1024 * 1024)) catch |err|
         fatalCode(.io_error, "cannot read '{s}': {s}", .{ path, @errorName(err) });
-    const image = hexfile.parse(arena, bytes) catch |err|
+    var image = hexfile.parse(arena, bytes) catch |err|
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
 
     const d = resolveDevice(flags);
@@ -1704,7 +1767,8 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
     if (!confirm(out, st, flags.force, "program {d} bytes to {s} flash (erases affected sectors)?", .{ image.totalBytes(), d.name }))
         fatal("aborted", .{});
 
-    const prep = prepareFlash(arena, bdm, flags, out, st);
+    // HCS08: also inserts the trim bytes (--trim) or carries the chip's own over.
+    const prep = prepareFlash(arena, bdm, flags, out, st, &image, true);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
 
@@ -1748,7 +1812,7 @@ fn cmdEeprom(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.
         fatal("aborted", .{});
 
     // Flash routine/params, but EEPROM align+sector; bit-31 global addr → D-flash.
-    var prep = prepareFlash(arena, bdm, flags, out, st);
+    var prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     prep.params.alignment = ee.align_bytes;
     prep.params.sector_size = @intCast(ee.sector);
     var rt = prep.ramTarget(&bdm.sess);
@@ -1782,13 +1846,23 @@ fn cmdVerify(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.
     const image = hexfile.parse(arena, bytes) catch |err|
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
 
-    const prep = prepareFlash(arena, bdm, flags, out, st);
+    const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
     for (image.segments) |seg| {
         drv.verify(seg.addr, seg.data) catch |err| mapRoutineError(drv.lastError(), err);
         try out.print("{s}verified {d} bytes at 0x{x:0>4}{s}\n", .{ st.green, seg.data.len, seg.addr, st.reset });
     }
+}
+
+/// A mass erase takes the factory/PGO oscillator trim with it: say so, and how to put one back.
+fn trimLostNote(d: lib_device.Device, out: *Io.Writer, st: tty.Style) void {
+    if (d.family != .hcs08) return;
+    const nv = lib.clock.defaultTrimNv(d.clock);
+    if (nv == 0) return;
+    out.print("{s}note:{s} the oscillator trim at 0x{x:0>4} was erased; an untrimmed part runs off-frequency. Re-trim with: program <image> --part {s} --trim <kHz>\n", .{
+        st.yellow, st.reset, nv, d.name,
+    }) catch {};
 }
 
 fn cmdErase(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) !void {
@@ -1803,7 +1877,7 @@ fn cmdErase(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.W
     } else {
         if (!confirm(out, st, flags.force, "MASS ERASE all flash on {s}? this wipes the entire chip", .{d.name})) fatal("aborted", .{});
     }
-    const prep = prepareFlash(arena, bdm, flags, out, st);
+    const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
     if (page) |addr| {
@@ -1811,16 +1885,19 @@ fn cmdErase(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.W
             try out.print("{s}note: 0x{x:0>4} rounded down to sector base 0x{x:0>4}{s}\n", .{ st.dim, page_raw.?, addr, st.reset });
         drv.eraseRange(addr, d.page_size) catch |err| mapRoutineError(drv.lastError(), err);
         try out.print("{s}erased sector at 0x{x:0>4}{s}\n", .{ st.green, addr, st.reset });
+        const nv = lib.clock.defaultTrimNv(d.clock);
+        if (d.family == .hcs08 and nv != 0 and nv >= addr and nv < addr + d.page_size) trimLostNote(d, out, st);
     } else {
         drv.massErase(d.flash_start) catch |err| mapRoutineError(drv.lastError(), err);
         try out.print("{s}mass erased{s}\n", .{ st.green, st.reset });
+        trimLostNote(d, out, st);
     }
 }
 
 fn cmdBlankCheck(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) !void {
     requireFlashTarget(flags);
     const d = resolveDevice(flags);
-    const prep = prepareFlash(arena, bdm, flags, out, st);
+    const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
     // 258 = up to 256 banked pages + two fixed windows.
@@ -1843,7 +1920,7 @@ fn cmdUnsecure(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *I
     const d = resolveDevice(flags);
     const val = lib_device.unsecuredSecurityByte(d.family);
     if (!confirm(out, st, flags.force, "UNSECURE {s}? this mass-erases the entire chip", .{d.name})) fatal("aborted", .{});
-    const prep = prepareFlash(arena, bdm, flags, out, st);
+    const prep = prepareFlash(arena, bdm, flags, out, st, null, false);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
     // Mass-erase leaves the security byte 0xFF (secured); program the unsecured
@@ -1853,6 +1930,7 @@ fn cmdUnsecure(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *I
     try out.print("{s}unsecured{s} (mass-erased, security@0x{x:0>4} = 0x{x:0>2}); power-cycle the target\n", .{
         st.green, st.reset, d.security_addr, val,
     });
+    trimLostNote(d, out, st);
 }
 
 /// secure: program the security byte to SECURED (SEC=0b00) - locks debug access.
@@ -1861,7 +1939,7 @@ fn cmdSecure(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.
     const d = resolveDevice(flags);
     const val = lib_device.securedSecurityByte(d.family);
     if (!confirm(out, st, flags.force, "SECURE {s}? this LOCKS debug access (erases the security sector); recovery needs 'unsecure'", .{d.name})) fatal("aborted", .{});
-    const prep = prepareFlash(arena, bdm, flags, out, st);
+    const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
     // Erase the security byte's sector so it can be reprogrammed.
@@ -3072,6 +3150,167 @@ test "e2e --sim+cpu backend: the REAL HCS08 routine programs through the sim sta
     try std.testing.expectEqualSlices(u8, &image, &back);
     try drv.eraseRange(0xE000, d.page_size);
     try drv.blankCheck(0xE000, d.page_size);
+}
+
+/// A simulated SH16 with the real CPU08 core, FCDIV enforced and an ICS clock model, plus a
+/// session on it. The oscillator trim starts at 01 81 as on the bench part.
+const Hcs08Rig = struct {
+    sim: Sim,
+    cpu: lib.cpu08.Cpu,
+    s: session.Session,
+    d: lib_device.Device,
+
+    fn init(gpa: std.mem.Allocator, rig: *Hcs08Rig) !void {
+        rig.d = lib_device.lookup("mc9s08sh16").?;
+        rig.sim = Sim.init(gpa, rig.d);
+        rig.cpu = try lib.cpu08.Cpu.init(gpa, rig.d.flash_base, rig.d.flash_start, rig.d.flash_end);
+        rig.cpu.require_fcdiv = true;
+        rig.cpu.hostWrite(0xFFAE, &.{ 0x01, 0x81 });
+        rig.sim.cpu = .{ .hcs08 = &rig.cpu };
+        rig.sim.ics = .{ .base = rig.d.clock_addr };
+        rig.s = session.Session.init(rig.sim.asTransport(.{}));
+        _ = rig.s.capabilities() catch {};
+        try rig.s.setOptions(lib.hcs08.options(.{}));
+        try rig.s.setTarget(.hcs08);
+        try rig.s.connect();
+    }
+    fn deinit(rig: *Hcs08Rig) void {
+        rig.cpu.deinit();
+        rig.sim.deinit();
+    }
+    fn ctx(rig: *Hcs08Rig) lib.hcs08.Ctx {
+        return .{ .sess = &rig.s, .dev = rig.d, .sleep_ms = noSleep };
+    }
+    fn noSleep(_: u32) void {}
+};
+
+test "HCS08: the flash controller refuses commands until bring-up loads FCDIV" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: Hcs08Rig = undefined;
+    try Hcs08Rig.init(gpa, &rig);
+    defer rig.deinit();
+
+    const prep = flashPrepFor(arena, rig.d, 8_600_000);
+    var rt = prep.ramTarget(&rig.s);
+    var drv = prep.driver(rt.iface());
+    const data = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+
+    // What `usbdm program` used to do on a freshly reset HCS08: straight to the routine.
+    try std.testing.expectError(error.RoutineError, drv.eraseRange(0xE000, 512));
+
+    var ctx = rig.ctx();
+    const res = try lib.hcs08.prepare(arena, &ctx, .{}, null);
+    try std.testing.expectEqual(@as(u8, 43), res.fcdiv); // the divider PGO chose for 8.63 MHz
+    try std.testing.expect(res.bus_hz > 8_000_000 and res.bus_hz < 9_000_000);
+    var fcdiv: [1]u8 = undefined;
+    try rig.s.readMem(.byte, 0x1820, &fcdiv);
+    try std.testing.expectEqual(@as(u8, 0x80 | 43), fcdiv[0]);
+    var cop: [1]u8 = undefined;
+    try rig.s.readMem(.byte, 0x1802, &cop);
+    try std.testing.expectEqual(@as(u8, 0x22), cop[0]); // COP off
+
+    // Same session, FCDIV now loaded: the real routine erases, programs and verifies.
+    try drv.eraseRange(0xE000, 512);
+    try drv.program(0xE000, &data);
+    try drv.verify(0xE000, &data);
+}
+
+test "HCS08 --trim: the search lands on the target and the bytes reach the image and the chip" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: Hcs08Rig = undefined;
+    try Hcs08Rig.init(gpa, &rig);
+    defer rig.deinit();
+
+    // An image with only vectors and an NVOPT: the trim bytes are not in the file, as on a real build.
+    var image = try hexfile.parse(arena, "S113FFF0000102030405060708090A0B0C0D0E0F85\nS9030000FC\n");
+    try std.testing.expectEqual(@as(?u8, null), image.byteAt(0xFFAE));
+
+    var ctx = rig.ctx();
+    // Reference 33.6 kHz; the modelled part is 33.7 kHz at trim 256, 0.19 % per step, larger = slower.
+    const res = try lib.hcs08.prepare(arena, &ctx, .{ .trim_hz = 33_600 }, &image);
+    const t = res.trim.?;
+    const ideal = 256.0 + (33.7 - 33.6) / 33.7 / 0.0019; // 257.56
+    try std.testing.expect(@abs(@as(f64, @floatFromInt(t.value)) - ideal) <= 1.0);
+    try std.testing.expectEqual(@as(?u8, @intCast(t.value >> 1)), image.byteAt(0xFFAF));
+    try std.testing.expectEqual(@as(?u8, @intCast(t.value & 1)), image.byteAt(0xFFAE)); // erased byte: other bits cleared
+    // Trimmed clock at the trim-time speed: 33.6 kHz * 64 within a step.
+    const err = @abs(@as(f64, @floatFromInt(t.measured_hz)) - 33_600.0 * 64.0) / (33_600.0 * 64.0);
+    try std.testing.expect(err < 0.0025);
+
+    // The programming clock afterwards is the known one, not the trimmed one.
+    var c2: [4]u8 = undefined;
+    try rig.s.readMem(.byte, 0x48, &c2);
+    try std.testing.expectEqual(@as(u8, 0x40), c2[1]); // BDIV /2
+    try std.testing.expectEqual(@as(u8, 0x80), c2[2]); // nominal TRIM
+
+    // Then the usual erase-all-then-program: the chip ends up with the new trim, not 01 81.
+    const prep = flashPrepFor(arena, rig.d, res.bus_hz);
+    var rt = prep.ramTarget(&rig.s);
+    var drv = prep.driver(rt.iface());
+    for (image.segments) |seg| try drv.eraseRange(seg.addr, @intCast(seg.data.len));
+    for (image.segments) |seg| try drv.program(seg.addr, seg.data);
+    var nv: [2]u8 = undefined;
+    try rig.s.readMem(.byte, 0xFFAE, &nv);
+    try std.testing.expectEqual(@as(u8, @intCast(t.value & 1)), nv[0]);
+    try std.testing.expectEqual(@as(u8, @intCast(t.value >> 1)), nv[1]);
+}
+
+test "HCS08 --trim keeps other bits of an NVFTRIM the image defines" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: Hcs08Rig = undefined;
+    try Hcs08Rig.init(gpa, &rig);
+    defer rig.deinit();
+    var ctx = rig.ctx();
+    // Hand-built image: 0xFFAE = 0x40 (some other option bit), nothing at 0xFFAF.
+    var img2 = try hexfile.parse(arena, "S104FFAE400E\nS9030000FC\n");
+    _ = try lib.hcs08.prepare(arena, &ctx, .{ .trim_hz = 33_600 }, &img2);
+    try std.testing.expectEqual(@as(u8, 0x40), img2.byteAt(0xFFAE).? & 0xFE); // bit 6 survives
+}
+
+test "HCS08 without --trim: the chip's own trim is carried across the sector erase" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: Hcs08Rig = undefined;
+    try Hcs08Rig.init(gpa, &rig);
+    defer rig.deinit();
+    var ctx = rig.ctx();
+
+    // Vector page image, no trim bytes: this is what `usbdm program` of a normal build looks like.
+    var image = try hexfile.parse(arena, "S113FFF0000102030405060708090A0B0C0D0E0F85\nS9030000FC\n");
+    const res = try lib.hcs08.prepare(arena, &ctx, .{}, &image);
+    try std.testing.expectEqual(@as([2]u8, .{ 0x01, 0x81 }), res.preserved.?);
+    try std.testing.expectEqual(@as(?u8, 0x01), image.byteAt(0xFFAE));
+    try std.testing.expectEqual(@as(?u8, 0x81), image.byteAt(0xFFAF));
+
+    const prep = flashPrepFor(arena, rig.d, res.bus_hz);
+    var rt = prep.ramTarget(&rig.s);
+    var drv = prep.driver(rt.iface());
+    for (image.segments) |seg| try drv.eraseRange(seg.addr, @intCast(seg.data.len));
+    for (image.segments) |seg| try drv.program(seg.addr, seg.data);
+    var nv: [2]u8 = undefined;
+    try rig.s.readMem(.byte, 0xFFAE, &nv);
+    try std.testing.expectEqual(@as([2]u8, .{ 0x01, 0x81 }), nv);
+
+    // An image that does not touch the vector sector leaves the trim alone and adds nothing.
+    var other = try hexfile.parse(arena, "S105E000AABBB5\nS9030000FC\n");
+    var rig2: Hcs08Rig = undefined;
+    try Hcs08Rig.init(gpa, &rig2);
+    defer rig2.deinit();
+    var ctx2 = rig2.ctx();
+    const res2 = try lib.hcs08.prepare(arena, &ctx2, .{}, &other);
+    try std.testing.expectEqual(@as(?[2]u8, null), res2.preserved);
+    try std.testing.expectEqual(@as(?u8, null), other.byteAt(0xFFAE));
 }
 
 test "e2e --sim+cpu backend: single-step executes a real instruction" {

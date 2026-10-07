@@ -24,7 +24,7 @@ pub const sdid_table = gen.sdid_table;
 /// Family generics (not in the XML): used when no --part is named, so a
 /// non-HCS08 target isn't handed HCS08 geometry.
 pub const generics = [_]Device{
-    .{ .name = "hcs08-generic", .ram_start = 0x80, .ram_end = 0x27F, .flash_start = 0x8000, .flash_end = 0xFFFF },
+    .{ .name = "hcs08-generic", .ram_start = 0x80, .ram_end = 0x27F, .flash_start = 0x8000, .flash_end = 0xFFFF, .sopt_addr = 0x1802 },
     .{ .name = "hcs12-generic", .family = .hcs12, .flash_base = 0x0100, .ram_start = 0x0800, .ram_end = 0x0FFF, .flash_start = 0x4000, .flash_end = 0x7FFF, .flash_start2 = 0xC000, .flash_end2 = 0xFFFF, .page_size = 512, .write_align = 2, .security_addr = 0xFF0F, .watchdog_addr = 0x003C, .hcs12_routine = .mmcv4_fts },
     .{ .name = "cfv1-generic", .family = .cfv1, .flash_base = 0xFF9820, .ram_start = 0x00800000, .ram_end = 0x00801FFF, .flash_start = 0x0, .flash_end = 0x1FFFF, .page_size = 1024, .write_align = 4, .security_addr = 0x40F, .watchdog_addr = 0xFF9802 },
 };
