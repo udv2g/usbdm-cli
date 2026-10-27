@@ -517,6 +517,16 @@ fn processFile(
             stats.report("{s}: no addressable flash window; skipped geometry", .{lname});
             continue;
         }
+        // S12G (GMMC) with a PPAGE window: the pages account for the whole flash
+        // (G96: 6 x 16K), so the flat sliver below 0x4000 (G96: 0x1000-0x1FFF, "gap
+        // between EEPROM and RAM") is left out and the fixed windows are the usual
+        // 0x4000-0x7FFF + 0xC000-0xFFFF pair.
+        if (fam == .hcs12 and std.mem.eql(u8, rt, GMMC) and nbank > 0 and nm > 2 and merged[0].end < 0x4000) {
+            stats.report("{s}: GMMC flat window 0x{X}-0x{X} below 0x4000 left out of the geometry", .{ lname, merged[0].start, merged[0].end });
+            var i: usize = 1;
+            while (i < nm) : (i += 1) merged[i - 1] = merged[i];
+            nm -= 1;
+        }
         const too_many_windows = nm > 2;
 
         const flash_start = merged[0].start;
@@ -531,23 +541,23 @@ fn processFile(
         var have_paged = false;
         var pg_first: u64 = 0;
         var pg_last: u64 = 0;
-        if (fam == .hcs12 and !is_gmmc and nbank > 0) {
+        if (fam == .hcs12 and nbank > 0) {
             var saw_reset = false;
             for (banked_buf[0..nbank]) |b| {
                 const pr = attr(b, "pageReset");
                 const pe = attr(b, "pageEnd");
-                if (pr != null and pe != null) {
+                if ((pr != null or is_gmmc) and pe != null) {
                     saw_reset = true;
                     const pev = parseNum(pe.?);
-                    // MMCV4 entries give the lowest page as pageReset. XMMC ones give
-                    // the reset page (0xFE) and size the window with `pages` instead:
+                    // MMCV4 entries give the lowest page as pageReset. XMMC and GMMC ones
+                    // give the reset page (0xFE / 0xE) and size the window with `pages`:
                     // a byte size when >= 1024 (e.g. "1024K" -> 64 pages), else a count
                     // (ref DeviceXmlParser memoryRange).
-                    const prv = if (is_xmmc) blk: {
-                        const pg = attr(b, "pages") orelse break :blk parseNum(pr.?);
+                    const prv = if (is_xmmc or is_gmmc) blk: {
+                        const pg = attr(b, "pages") orelse break :blk parseNum(pr orelse pe.?);
                         const n = parseNum(pg);
                         const count = if (n >= 1024) n / 0x4000 else n;
-                        break :blk if (count >= 1 and count <= pev + 1) pev + 1 - count else parseNum(pr.?);
+                        break :blk if (count >= 1 and count <= pev + 1) pev + 1 - count else parseNum(pr orelse pe.?);
                     } else parseNum(pr.?);
                     // paged only if pages exist below the top two fixed windows; else they cover all -> null
                     if (prv + 2 <= pev) {

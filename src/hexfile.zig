@@ -262,6 +262,40 @@ pub const EmitError = error{
     AddressOverflow,
 } || Io.Writer.Error;
 
+/// Merge segments that share one `alignment`-byte write unit, filling the gap
+/// with 0xFF. A flash routine pads each segment out to its unit alone, so two
+/// small records in one unit (S12G vector words in one 8-byte phrase) would
+/// program that unit twice, and FTMRG refuses the second write.
+pub fn mergeSharedUnits(gpa: Allocator, image: Image, alignment: u32) Allocator.Error!Image {
+    if (alignment <= 1) return image;
+    var out: std.ArrayList(Segment) = .empty;
+    errdefer {
+        for (out.items) |seg| gpa.free(seg.data);
+        out.deinit(gpa);
+    }
+    for (image.segments) |seg| {
+        if (seg.data.len == 0) continue;
+        if (out.items.len > 0) {
+            const last = &out.items[out.items.len - 1];
+            const last_end = last.addr + @as(u32, @intCast(last.data.len)); // one past
+            const unit_end = (last_end + alignment - 1) / alignment * alignment;
+            if (seg.addr < unit_end) {
+                const new_end = seg.addr + @as(u32, @intCast(seg.data.len));
+                const merged_len = @max(last_end, new_end) - last.addr;
+                const buf = try gpa.alloc(u8, merged_len);
+                @memset(buf, 0xFF);
+                @memcpy(buf[0..last.data.len], last.data);
+                @memcpy(buf[seg.addr - last.addr ..][0..seg.data.len], seg.data);
+                gpa.free(last.data);
+                last.data = buf;
+                continue;
+            }
+        }
+        try out.append(gpa, .{ .addr = seg.addr, .data = try gpa.dupe(u8, seg.data) });
+    }
+    return .{ .segments = try out.toOwnedSlice(gpa) };
+}
+
 /// Write an image. Binary requires exactly one segment (gaps unrepresentable); srec/ihex any.
 pub fn emit(out: *Io.Writer, image: Image, format: Format) EmitError!void {
     switch (format) {
@@ -686,4 +720,25 @@ test "Image.setByte inserts, merges neighbours and overwrites" {
     try std.testing.expectEqual(@as(u32, 0x1F), img.segments[2].addr);
     try std.testing.expectEqual(@as(usize, 3), img.segments[2].data.len);
     try std.testing.expectEqual(@as(u32, 0x40), img.segments[3].addr);
+}
+
+test "mergeSharedUnits joins records in one write unit, leaves others apart" {
+    const gpa = std.testing.allocator;
+    var a = [_]u8{ 0xAA, 0xBB };
+    var b = [_]u8{ 0xCC, 0xDD };
+    var c = [_]u8{0xEE};
+    var segs = [_]Segment{
+        .{ .addr = 0xFFB2, .data = &a },
+        .{ .addr = 0xFFB6, .data = &b },
+        .{ .addr = 0xFFC2, .data = &c },
+    };
+    var m = try mergeSharedUnits(gpa, .{ .segments = &segs }, 8);
+    defer m.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), m.segments.len);
+    try std.testing.expectEqual(@as(u32, 0xFFB2), m.segments[0].addr);
+    try std.testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xFF, 0xFF, 0xCC, 0xDD }, m.segments[0].data);
+    try std.testing.expectEqual(@as(u32, 0xFFC2), m.segments[1].addr);
+    // alignment 1 passes the image through untouched
+    const same = try mergeSharedUnits(gpa, .{ .segments = &segs }, 1);
+    try std.testing.expectEqual(@as(usize, 3), same.segments.len);
 }

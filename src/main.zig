@@ -1597,6 +1597,7 @@ fn prepareFlash(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *
         break :blk hz;
     };
     if (d.family == .hcs12 and d.hcs12_routine == .xmmc_xftmrk) initXmmcFlash(bdm, d, bus_hz);
+    if (d.family == .hcs12 and d.hcs12_routine == .gmmc_ftmrg) initGmmcFlash(bdm, d, bus_hz);
     return flashPrepFor(arena, d, bus_hz);
 }
 
@@ -1619,6 +1620,32 @@ fn xmmcFlashDivider(bus_khz: u32) ?u8 {
 fn initXmmcFlash(bdm: *Bdm, d: lib_device.Device, bus_hz: u32) void {
     const div = xmmcFlashDivider(bus_hz / 1000) orelse
         fatal("no XFTMRK flash clock divider for a {d} kHz bus clock (needs 800..1050 kHz from 2x bus); check --bus-hz", .{bus_hz / 1000});
+    initFtmrFlash(bdm, d, div, "XFTMRK");
+}
+
+/// FTMRG (S12G) flash-clock divider for a bus clock in kHz, or null if no divider
+/// puts the flash clock in 800..1050 kHz. Clocked from the BUS clock (ref
+/// HCS12-FTMRCK-flash-scripts.tcl calculateFlashDivider: round((f - 1101) / 1000)).
+fn gmmcFlashDivider(bus_khz: u32) ?u8 {
+    if (bus_khz < 1000) return null;
+    const f: f64 = @floatFromInt(bus_khz);
+    const div = @round((f - 1101.0) / 1000.0);
+    if (div < 0 or div > 0x3F) return null;
+    const flash_clk = f / (div + 1.0);
+    if (flash_clk < 800 or flash_clk > 1050) return null;
+    return @intFromFloat(div);
+}
+
+/// Like the XFTMRK routine, the FTMRG one expects FCLKDIV already loaded and
+/// reports "invalid flash clock divider" otherwise: COP off, load FCLKDIV,
+/// unprotect P-flash and D-flash (ref FTMRCK initTarget/initFlash).
+fn initGmmcFlash(bdm: *Bdm, d: lib_device.Device, bus_hz: u32) void {
+    const div = gmmcFlashDivider(bus_hz / 1000) orelse
+        fatal("no FTMRG flash clock divider for a {d} kHz bus clock (needs 800..1050 kHz); check --bus-hz", .{bus_hz / 1000});
+    initFtmrFlash(bdm, d, div, "FTMRG");
+}
+
+fn initFtmrFlash(bdm: *Bdm, d: lib_device.Device, div: u8, name: []const u8) void {
     const base: u32 = d.flash_base;
     const writes = [_]struct { addr: u32, val: u8 }{
         .{ .addr = d.watchdog_addr, .val = 0x40 }, // COPCTL: COP off
@@ -1629,7 +1656,7 @@ fn initXmmcFlash(bdm: *Bdm, d: lib_device.Device, bus_hz: u32) void {
     for (writes) |w| {
         if (w.addr == 0) continue;
         bdm.sess.writeMem(.byte, w.addr, &.{w.val}) catch |err|
-            fatal("XFTMRK flash init: write 0x{x:0>4} failed: {s}", .{ w.addr, @errorName(err) });
+            fatal("{s} flash init: write 0x{x:0>4} failed: {s}", .{ name, w.addr, @errorName(err) });
     }
 }
 
@@ -1754,6 +1781,20 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
 
     const d = resolveDevice(flags);
+    // An erased security byte reads 0xFF = SECURED. When the image rewrites the
+    // sector it lives in but does not define it (S12 images usually leave
+    // 0xFF00-0xFF0F out), program the unsecured value so the part stays debuggable.
+    if (d.family == .hcs12) {
+        const sec_sector = d.security_addr & ~(d.page_size - 1);
+        if (image.overlaps(sec_sector, sec_sector + d.page_size - 1) and !image.overlaps(d.security_addr, d.security_addr)) {
+            const val = lib_device.unsecuredSecurityByte(d.family);
+            image.setByte(arena, d.security_addr, val) catch |err|
+                fatalCode(.io_error, "cannot prepare '{s}': {s}", .{ path, @errorName(err) });
+            try out.print("{s}note:{s} image leaves the security byte 0x{x:0>4} undefined; programming it unsecured (0x{x:0>2})\n", .{ st.dim, st.reset, d.security_addr, val });
+        }
+    }
+    image = hexfile.mergeSharedUnits(arena, image, d.write_align) catch |err|
+        fatalCode(.io_error, "cannot prepare '{s}': {s}", .{ path, @errorName(err) });
     for (image.segments) |seg| {
         if (seg.data.len == 0) continue;
         const seg_end = seg.addr + @as(u32, @intCast(seg.data.len - 1));
@@ -1843,8 +1884,12 @@ fn cmdVerify(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.
     const path = flags.positionals[1];
     const bytes = Io.Dir.cwd().readFileAlloc(global_io, path, arena, .limited(16 * 1024 * 1024)) catch |err|
         fatalCode(.io_error, "cannot read '{s}': {s}", .{ path, @errorName(err) });
-    const image = hexfile.parse(arena, bytes) catch |err|
+    var image = hexfile.parse(arena, bytes) catch |err|
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
+    // Same unit merge as `program`: a record padded out to its write unit alone
+    // would be compared against its neighbour's bytes.
+    image = hexfile.mergeSharedUnits(arena, image, resolveDevice(flags).write_align) catch |err|
+        fatalCode(.io_error, "cannot prepare '{s}': {s}", .{ path, @errorName(err) });
 
     const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
@@ -3388,4 +3433,12 @@ test "e2e --sim+cpu backend: the REAL HCS12 FTS routine programs through the sim
     var back: [8]u8 = undefined;
     try s.readMem(.byte, 0x4000, &back);
     try std.testing.expectEqualSlices(u8, &image, &back);
+}
+
+test "gmmcFlashDivider follows the FTMRCK reference script" {
+    try std.testing.expectEqual(@as(?u8, 5), gmmcFlashDivider(6243));
+    try std.testing.expectEqual(@as(?u8, 7), gmmcFlashDivider(8000));
+    try std.testing.expectEqual(@as(?u8, 0), gmmcFlashDivider(1000));
+    try std.testing.expectEqual(@as(?u8, null), gmmcFlashDivider(500));
+    try std.testing.expectEqual(@as(?u8, null), gmmcFlashDivider(100000)); // beyond FDIV
 }
