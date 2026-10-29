@@ -19,6 +19,7 @@ usbdm pins bkgd=low reset=3state | release
 
 usbdm program app.s19 --part mc9s08jm60   # erase affected sectors, program, verify
 usbdm verify | erase [0xADDR] | blank-check --part ...
+usbdm program app.s19 --part mc9s08sh16 --trim 33.6   # HCS08: re-trim the oscillator
 usbdm unsecure | secure --part ...        # clear / set flash security
 usbdm eeprom img.s19 --part mc9s12g240    # EEPROM/data-flash (S12G GMMC parts)
 usbdm gdb --port 1234                     # GDB remote stub over TCP
@@ -54,6 +55,43 @@ device DB), which also backs `identify`. Families: HCS08/RS08, HCS12 (classic S1
 S12G, and S12XE/XS/XF on the paged map), CFV1, plus S12G EEPROM. Destructive
 commands confirm unless `--force`. HCS12 flash operations start with a
 special-mode reset, so the target does not need to be halted first.
+
+### HCS12 flash
+
+Three flash modules are covered, each by its vendored USBDM routine:
+
+| Family | Routine | Parts |
+| --- | --- | --- |
+| Classic S12 | FTS | e.g. MC9S12DP256 |
+| S12G (FTMRG) | GMMC | G48..G240, GA240, VR48/64 (G96 verified) |
+| S12XE/XS/XF (XFTMRK) | XMMC | XEP100 family, XS64/128/256, XF512 (XET256 verified) |
+
+Every HCS12 flash command starts with a special-mode hardware reset and a reconnect, so
+a board running its own code can be flashed without halting it first (a running target
+acks memory access but not the PC write that starts the routine). The FTMRG and XFTMRK
+routines report an invalid divider unless `FCLKDIV` is already loaded, so the tool does
+what the reference script does before running them: COP off, `FCLKDIV` from the measured
+bus clock, `FPROT`/`EPROT` unprotected.
+
+**Paged flash.** The S12G and S12X parts are programmed through the PPAGE window.
+`pages`/`pageEnd` come from the device DB: G96 is pages 0x0A-0x0F (96K), and the flat
+sliver below 0x4000 is left out because the pages already cover the whole flash. XMMC
+entries size the window from the page count (1024K starts at page 0xC0).
+
+**Image handling for FTMRG.**
+
+- `program` and `verify` merge records that share one 8-byte write unit. FTMRG refuses a
+  second write to a phrase, which sparse vector records (two vectors in one phrase) hit.
+- If the image erases the security sector without defining the security byte, `program`
+  writes the unsecured value (`FSEC` = 0xFE). An erased 0xFF reads as secured.
+
+`--sim` refuses XFTMRK parts: there is no S12XE flash model, and the FTS one would report
+a meaningless pass.
+
+Verified on hardware: MC9S12XET256 (61 KB across both fixed windows and four PPAGE pages,
+read back through the raw BDM) and MC9S12G96 (all segments of an EVSE image verified,
+`FSEC` 0xFE, reset vector 0xC000). Not covered: neither image has been tested running on
+the G96, and the other S12G parts use the same routine but are untested.
 
 ### HCS08 flash bring-up and oscillator trim
 
@@ -98,6 +136,8 @@ watchpoints use GDB software breakpoints.
 - `ramflash` / `flash` - RAM flash-routine engine; BDM byte access
 - `hwbreak` / `gdb` / `gdbstub` - hardware breakpoints; GDB RSP dispatch + framing
 - `hexfile` / `hexdump` / `tty` - S-record/IHEX codec; output formatting
+- `hcs08` / `clock` - HCS08 flash bring-up (reset, COP, ICS clock, FCDIV); oscillator
+  trim search
 - `sim` - software virtual dongle+target (`--sim`)
 - `cpu08` / `cfv1` / `cpu12` - functional CPU + flash-module emulators
 - `main` - CLI + GDB TCP server
