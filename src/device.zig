@@ -6,6 +6,7 @@ const types = @import("device_types");
 const gen = @import("device_gen");
 
 pub const Family = types.Family;
+pub const Hcs08Routine = types.Hcs08Routine;
 pub const Hcs12Routine = types.Hcs12Routine;
 pub const Paged = types.Paged;
 pub const Eeprom = types.Eeprom;
@@ -63,6 +64,42 @@ pub fn identify(family: Family, value: u32) ?SdidEntry {
         if (v & e.mask == e.sdid) return e;
     }
     return null;
+}
+
+/// `identify` for a read from `addr`: only entries whose SDID lives there (HCS08
+/// has two maps: 0x1806 classic, 0x3002 S08P).
+pub fn identifyAt(family: Family, addr: u32, value: u32) ?SdidEntry {
+    const v: u16 = @truncate(value);
+    for (sdid_table) |e| {
+        if (e.family != family or e.sdid_addr != addr) continue;
+        if (v & e.mask == e.sdid) return e;
+    }
+    return null;
+}
+
+/// Where a part's SDID register is: its own SDID entry's address, else the family's.
+pub fn sdidAddrFor(dev: Device) u32 {
+    for (sdid_table) |e| {
+        if (e.family == dev.family and std.ascii.eqlIgnoreCase(e.name, dev.name)) return e.sdid_addr;
+    }
+    return familySdidAddr(dev.family);
+}
+
+/// The distinct SDID addresses a family's parts use, family default first; for
+/// auto-detect, which has to try each. Fills `buf`, returns the used part.
+pub fn sdidAddrs(family: Family, buf: []u32) []u32 {
+    var n: usize = 0;
+    if (buf.len == 0) return buf[0..0];
+    buf[0] = familySdidAddr(family);
+    n = 1;
+    outer: for (sdid_table) |e| {
+        if (e.family != family) continue;
+        for (buf[0..n]) |a| if (a == e.sdid_addr) continue :outer;
+        if (n == buf.len) break;
+        buf[n] = e.sdid_addr;
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 test "lookup finds known parts and the generic fallback" {
@@ -225,4 +262,45 @@ test "SDID auto-detect: identify maps a device-id read to a part" {
     try std.testing.expect(0xF085 & g.mask == g.sdid);
     try std.testing.expect(std.mem.startsWith(u8, g.name, "mc9s12g"));
     try std.testing.expectEqual(@as(?SdidEntry, null), identify(.hcs08, 0x7FF));
+}
+
+test "S08P parts: generated geometry, routine kind, register map, SDID at 0x3002" {
+    // PA60: split flash around the 0x30xx registers + EEPROM, PTxx routine.
+    const pa60 = lookup("mc9s08pa60").?;
+    try std.testing.expectEqual(Family.hcs08, pa60.family);
+    try std.testing.expectEqual(Hcs08Routine.s08p_ptxx, pa60.hcs08_routine);
+    try std.testing.expectEqual(@as(u32, 0x3020), pa60.flash_base);
+    try std.testing.expectEqual(@as(u32, 0x3001), pa60.sbdfr_addr);
+    try std.testing.expectEqual(@as(u32, 0x3030), pa60.watchdog_addr); // WDOG_CS1
+    try std.testing.expectEqual(@as(u32, 0), pa60.sopt_addr); // never write SOPT_INIT there
+    try std.testing.expectEqual(@as(u32, 0xFF7F), pa60.security_addr); // NV_FSEC
+    try std.testing.expectEqual(@as(u32, 4), pa60.write_align);
+    try std.testing.expectEqual(@as(u32, 0x3038), pa60.clock_addr);
+    try std.testing.expect(pa60.inFlash(0x1040) and pa60.inFlash(0x2FFF) and pa60.inFlash(0x3200) and pa60.inFlash(0xFFFF));
+    try std.testing.expect(!pa60.inFlash(0x3020) and !pa60.inFlash(0x3100)); // registers, EEPROM
+    const ee = pa60.eeprom.?;
+    try std.testing.expectEqual(@as(u32, 0x3100), ee.base_global);
+    try std.testing.expectEqual(@as(u32, 0x100), ee.size);
+    try std.testing.expectEqual(@as(u32, 2), ee.sector);
+    try std.testing.expectEqual(types.s08p_eeprom_flag, ee.addr_flag);
+    // Aliases inherit (PT60 -> PA60); PA2's routine sits in its flash block.
+    try std.testing.expectEqual(Hcs08Routine.s08p_ptxx, lookup("mc9s08pt60").?.hcs08_routine);
+    try std.testing.expectEqual(Hcs08Routine.s08p_small, lookup("mc9s08pa2").?.hcs08_routine);
+    try std.testing.expectEqual(@as(?Eeprom, null), lookup("mc9s08pa2").?.eeprom); // separate routine, not supported
+    const pb8 = lookup("mc9s08pb8").?;
+    try std.testing.expectEqual(Hcs08Routine.s08p_pbxx, pb8.hcs08_routine);
+    try std.testing.expectEqual(@as(u32, 0x3008), pb8.watchdog_addr); // SOPT5 COP
+    // Classic parts are untouched.
+    const qg8 = lookup("mc9s08qg8").?;
+    try std.testing.expectEqual(Hcs08Routine.classic, qg8.hcs08_routine);
+    try std.testing.expectEqual(@as(u32, 0x1801), qg8.sbdfr_addr);
+    // SDID: at 0x3002, matched only against S08P entries there.
+    try std.testing.expectEqual(@as(u32, 0x3002), sdidAddrFor(pa60));
+    try std.testing.expectEqual(@as(u32, 0x1806), sdidAddrFor(qg8));
+    const m = identifyAt(.hcs08, 0x3002, 0x1040) orelse return error.NotFound; // rev nibble masked
+    try std.testing.expect(std.mem.startsWith(u8, m.name, "mc9s08p"));
+    var buf: [4]u32 = undefined;
+    const addrs = sdidAddrs(.hcs08, &buf);
+    try std.testing.expectEqual(@as(u32, 0x1806), addrs[0]);
+    try std.testing.expect(std.mem.indexOfScalar(u32, addrs, 0x3002) != null);
 }

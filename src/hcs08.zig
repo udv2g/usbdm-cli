@@ -28,6 +28,26 @@ const FCDIV_OFFSET: u32 = 0;
 const FPROT_OFFSET: u32 = 4;
 const FCDIV_DIVLD: u8 = 0x80;
 
+/// S08P NVM (FCCOB controller) register offsets from its base (0x3020) and bits
+/// (MC9S08PA60RM 4.6; HCS08-PTxx-flash-scripts.tcl).
+pub const s08p = struct {
+    pub const FCLKDIV: u32 = 0x0;
+    pub const FSEC: u32 = 0x1;
+    pub const FCCOBIX: u32 = 0x2;
+    pub const FSTAT: u32 = 0x6;
+    pub const FPROT: u32 = 0x8;
+    pub const EEPROT: u32 = 0x9;
+    pub const FCCOBHI: u32 = 0xA;
+    pub const FCCOBLO: u32 = 0xB;
+    pub const FDIVLD: u8 = 0x80;
+    pub const CCIF: u8 = 0x80;
+    pub const ACCERR: u8 = 0x20;
+    pub const FPVIOL: u8 = 0x10;
+    pub const SEC_MASK: u8 = 0x03;
+    pub const SEC_UNSECURED: u8 = 0x02;
+    pub const CMD_ERASE_ALL_BLOCKS: u8 = 0x08;
+};
+
 pub const Ctx = struct {
     sess: *session.Session,
     dev: device.Device,
@@ -60,6 +80,8 @@ pub const Result = struct {
 };
 
 pub const Error = error{
+    FlashCommandFailed,
+    FlashCommandTimeout,
     NoFlashDivider,
     FcdivNotLoaded,
     TrimNotSupported,
@@ -76,6 +98,14 @@ pub const Error = error{
 pub fn options(base: session.Options) session.Options {
     var o = base;
     o.use_alt_bdm_clock = 1; // CS_NORMAL
+    return o;
+}
+
+/// `options` for a known part: also points the pod's software reset at the part's
+/// SBDFR (0x3001 on S08P, where 0x1801 is plain RAM or flash).
+pub fn optionsFor(base: session.Options, dev: device.Device) session.Options {
+    var o = options(base);
+    o.sbdfr_address = @intCast(dev.sbdfr_addr);
     return o;
 }
 
@@ -221,6 +251,15 @@ pub fn prepare(gpa: std.mem.Allocator, c: *Ctx, req: Request, image: ?*hexfile.I
             res.soft_error = res.soft_error orelse e;
         };
     }
+    // S08P: PA/PT/PL have a WDOG (off in active background, refreshed by the routine
+    // while it runs; reconfiguring it takes an unlock sequence BDM is too slow for).
+    // PB has a classic COP in SOPT5 that the reference script clears.
+    if (c.dev.hcs08_routine == .s08p_pbxx and c.dev.watchdog_addr != 0) {
+        writeReg(c, c.dev.watchdog_addr, 0x00) catch |e| {
+            if (!soft) return e;
+            res.soft_error = res.soft_error orelse e;
+        };
+    }
 
     const nv = req.nvloc orelse clock.defaultTrimNv(ty);
 
@@ -273,6 +312,14 @@ pub fn prepare(gpa: std.mem.Allocator, c: *Ctx, req: Request, image: ?*hexfile.I
     res.bus_hz = bus_hz;
 
     const khz = (bus_hz + 500) / 1000;
+    if (c.dev.hcs08_routine.isS08p()) {
+        res.fcdiv = initS08pFlash(c, khz) catch |e| blk: {
+            if (!soft) return e;
+            res.soft_error = res.soft_error orelse e;
+            break :blk 0;
+        };
+        return res;
+    }
     const div = clock.flashDivider(khz) orelse {
         if (!soft) return error.NoFlashDivider;
         res.soft_error = res.soft_error orelse error.NoFlashDivider;
@@ -291,6 +338,46 @@ pub fn prepare(gpa: std.mem.Allocator, c: *Ctx, req: Request, image: ?*hexfile.I
         res.soft_error = res.soft_error orelse e;
     };
     return res;
+}
+
+/// S08P initFlash: FCLKDIV for a ~1 MHz flash clock (not write-once here, but it
+/// must read back loaded: FDIVLD set and the value taken, i.e. FDIVLCK not set by
+/// firmware), then FPROT/EEPROT open (ref HCS08-PTxx-flash-scripts.tcl initFlash).
+/// Returns the divider written. Also used by `gdb` (no reset there), which is why
+/// it does not depend on the rest of `prepare`.
+pub fn initS08pFlash(c: *Ctx, khz: u32) anyerror!u8 {
+    const div = clock.s08pFlashDivider(khz) orelse return error.NoFlashDivider;
+    const base = c.dev.flash_base;
+    try writeReg(c, base + s08p.FCLKDIV, div);
+    const rb = try readByte(c, base + s08p.FCLKDIV);
+    if (rb & s08p.FDIVLD == 0 or rb & 0x3F != div) return error.FcdivNotLoaded;
+    try writeReg(c, base + s08p.FPROT, 0xFF);
+    // PB has no EEPROM (and no EEPROT); the reference script leaves it alone there.
+    if (c.dev.hcs08_routine != .s08p_pbxx) try writeReg(c, base + s08p.EEPROT, 0xFF);
+    return div;
+}
+
+/// S08P mass erase from the host, the reference massEraseTarget: Erase All Blocks
+/// (0x08) through the NVM registers. The routine can't do this on a secured part,
+/// since secured RAM is not BDM-accessible (MC9S08PA60RM 4.5.2.7.2), but the NVM
+/// registers are and 0x08 is allowed secured. Needs FCLKDIV loaded (`prepare`).
+/// Leaves the part unsecured until the next reset; returns whether FSEC says so.
+pub fn s08pMassErase(c: *Ctx) anyerror!bool {
+    const base = c.dev.flash_base;
+    try writeReg(c, base + s08p.FSTAT, s08p.ACCERR | s08p.FPVIOL); // clear errors
+    try writeReg(c, base + s08p.FCCOBIX, 0);
+    try writeReg(c, base + s08p.FCCOBHI, s08p.CMD_ERASE_ALL_BLOCKS);
+    try writeReg(c, base + s08p.FSTAT, s08p.CCIF); // launch
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        c.sleep_ms(20);
+        const st = try readByte(c, base + s08p.FSTAT);
+        if (st & (s08p.ACCERR | s08p.FPVIOL) != 0) return error.FlashCommandFailed;
+        if (st & s08p.CCIF != 0) break;
+        if (tries >= 100) return error.FlashCommandTimeout; // ~2 s; the part takes ~100 ms
+    }
+    const fsec = try readByte(c, base + s08p.FSEC);
+    return fsec & s08p.SEC_MASK == s08p.SEC_UNSECURED;
 }
 
 extern "c" fn usleep(us: c_uint) c_int;

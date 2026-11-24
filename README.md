@@ -21,7 +21,7 @@ usbdm program app.s19 --part mc9s08jm60   # erase affected sectors, program, ver
 usbdm verify | erase [0xADDR] | blank-check --part ...
 usbdm program app.s19 --part mc9s08sh16 --trim 33.6   # HCS08: re-trim the oscillator
 usbdm unsecure | secure --part ...        # clear / set flash security
-usbdm eeprom img.s19 --part mc9s12g240    # EEPROM/data-flash (S12G GMMC parts)
+usbdm eeprom img.s19 --part mc9s12g240    # EEPROM/data-flash (S12G GMMC, S08P PA8..PA60)
 usbdm gdb --port 1234                     # GDB remote stub over TCP
 ```
 
@@ -50,9 +50,10 @@ behave as on-target. USB-only commands (`probe`/`version`/`list`) are declined.
 ## Flash programming
 
 Reference RAM flash-routine method: vendored routines run on the target CPU.
-Geometry (`--part`) comes from a build-time table of 193 parts (vendored USBDM
-device DB), which also backs `identify`. Families: HCS08/RS08, HCS12 (classic S12,
-S12G, and S12XE/XS/XF on the paged map), CFV1, plus S12G EEPROM. Destructive
+Geometry (`--part`) comes from a build-time table of 215 parts (vendored USBDM
+device DB), which also backs `identify`. Families: HCS08/RS08 (classic and the S08P
+PA/PT/PL/PB parts), HCS12 (classic S12, S12G, and S12XE/XS/XF on the paged map), CFV1,
+plus S12G and S08P EEPROM. Destructive
 commands confirm unless `--force`. HCS12 flash operations start with a
 special-mode reset, so the target does not need to be halted first.
 
@@ -121,6 +122,68 @@ Trim is implemented for the ICS clock variants (tested on ICSV2, MC9S08SH16); IC
 parts get the preserve-by-default behaviour only. A mass erase (`erase`, `unsecure`)
 removes the trim and says so.
 
+### S08P flash (PA/PT/PL/PB)
+
+The S08P parts (the device DB's "HCS08Plus") are HCS08 cores with a different register
+map (0x30xx) and an FCCOB command-queue flash controller at 0x3020, closer to the S12G one
+than to the classic HCS08 controller. Each family has its own vendored USBDM routine:
+
+| Parts | Routine | Notes |
+| --- | --- | --- |
+| PA8..PA60, PT8..PT60, PL8..PL60 | PTxx (large code) | flash + EEPROM (0x3100) |
+| PA2, PA4 | PAxx-small (small code) | flash only (their EEPROM routine is not vendored) |
+| PB8, PB16 | PBxx (large code) | no verify op: verify is a BDM readback |
+
+What differs from a classic HCS08 flash operation (refs: `HCS08-PTxx-flash-scripts.tcl`,
+MC9S08PA60RM):
+
+- The software special reset goes through `SBDFR` at 0x3001, not 0x1801. `--part`
+  selects it for every command, `reset` included.
+- No `SOPT` write. The device DB's `soptAddress` (0x3030) is `WDOG_CS1` on these parts.
+  The watchdog is off in active background mode and the routines refresh it while they
+  run. PB has a classic COP in `SOPT5` (0x3008), which is cleared, as the reference
+  script does.
+- `FCLKDIV` = (bus kHz + 399) / 1000 - 1 for a ~1 MHz flash clock (RM Table 4-7, 1-20
+  MHz bus). Then `FPROT`/`EEPROT` are opened. Without the divider the controller refuses
+  every command.
+- Flash is programmed in 4-byte phrases. Records are padded with 0xFF and merged where
+  they share a phrase.
+- If an image rewrites the 0xFE00 sector without defining `NV_FSEC` (0xFF7F), `program`
+  writes 0xFE (unsecured), as for S12G.
+- `program` and `verify` route records at the EEPROM's CPU address (0x3100..0x31FF) to
+  the EEPROM commands. `eeprom` takes either those addresses or 0-based offsets.
+- `erase` (mass) and `unsecure` run *Erase All Blocks* from the host through the NVM
+  registers, which also clears the EEPROM. On a secured part RAM is closed to BDM, so the
+  routine can't run until that command has unsecured the part (RM 4.5.2.7.2). `unsecure`
+  then programs `NV_FSEC` with the routine. A plain `erase` leaves `NV_FSEC` erased
+  (0xFF), so the part comes up secured at the next reset, including the special reset
+  that `program` starts with. Run `unsecure` instead before programming an image.
+- `identify` reads the SDID at 0x3002. PA32/PA60/PT32/PT60/PL32/PL60 share one SDID, as
+  do the 8K/16K parts, so `--part` is still needed.
+- `--trim` works on ICSV4 (bus = reference × 512 / BDIV, no /2). The trim bytes go to
+  0xFF6E/0xFF6F.
+
+The upstream PTxx/PBxx routines test `FSTAT` with `BIT $05` (a direct read of port
+register 0x0005) where `BIT #` was meant, so they don't reliably report `ACCERR` or
+`FPVIOL`. The program op's built-in blank check and verify catch a failed program or
+erase anyway. With `--no-verify` on a PB part, nothing would catch it.
+
+`--sim` emulates S08P parts: a full HCS08 core runs the real routines against an FCCOB
+model (FCLKDIV gating, phrase alignment, security, Erase All Blocks). It also models the
+illegal-address reset (ILAD), so a routine that strays outside the memory map fails in
+the simulator, as it would on the part.
+
+Bench-tested on an MC9S08PA32 (SDID 0x6040) through a JS16 pod. These all worked:
+`identify`, `connect`, `program`/`verify` (flash and EEPROM), sector `erase`, mass
+`erase`, and `unsecure`, both unsecured and on a secured part. A 32 KB firmware image
+round-tripped through all of them. PT, PL, PB and PA2/PA4 have only run in the simulator.
+
+Several programs driving pods on one USB hub? Pick each pod with `--device <n>`, not
+`--serial`. `--serial` opens every pod to read its serial number, and on a busy bench
+that disturbed BDM traffic on another pod. Every routine download is now read back
+before it runs, so a corrupted download fails cleanly ("read back wrong twice") instead
+of executing.
+
 ## GDB remote stub
 
 `usbdm gdb` serves the GDB remote protocol over TCP: registers, memory,
@@ -136,10 +199,11 @@ watchpoints use GDB software breakpoints.
 - `ramflash` / `flash` - RAM flash-routine engine; BDM byte access
 - `hwbreak` / `gdb` / `gdbstub` - hardware breakpoints; GDB RSP dispatch + framing
 - `hexfile` / `hexdump` / `tty` - S-record/IHEX codec; output formatting
-- `hcs08` / `clock` - HCS08 flash bring-up (reset, COP, ICS clock, FCDIV); oscillator
-  trim search
+- `hcs08` / `clock` - HCS08 flash bring-up (reset, COP, ICS clock, FCDIV; S08P SBDFR,
+  FCLKDIV, Erase All Blocks); oscillator trim search
 - `sim` - software virtual dongle+target (`--sim`)
-- `cpu08` / `cfv1` / `cpu12` - functional CPU + flash-module emulators
+- `cpu08` / `cfv1` / `cpu12` - functional CPU + flash-module emulators (`cpu08`: the
+  full HCS08 instruction set, classic FCMD and S08P FCCOB controllers)
 - `main` - CLI + GDB TCP server
 - `vendor/` - pinned upstream: libusb, `Commands.h`, flash-routine blobs, device XML
 

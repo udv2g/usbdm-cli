@@ -553,7 +553,10 @@ fn runSim(
     var cfv1_cpu: lib.cfv1_emu.Cpu = undefined;
     switch (familyOfTarget(flags.target)) {
         .hcs08 => {
-            hcs08_cpu = lib.cpu08.Cpu.init(arena, d.flash_base, flash_lo, flash_hi) catch fatal("out of memory building the emulator", .{});
+            hcs08_cpu = if (d.hcs08_routine.isS08p())
+                lib.cpu08.Cpu.initS08p(arena, s08pLayout(d)) catch fatal("out of memory building the emulator", .{})
+            else
+                lib.cpu08.Cpu.init(arena, d.flash_base, flash_lo, flash_hi) catch fatal("out of memory building the emulator", .{});
             hcs08_cpu.halted = true; // target starts halted (special mode)
             sim.cpu = .{ .hcs08 = &hcs08_cpu };
         },
@@ -599,6 +602,19 @@ fn runSim(
     try out.flush();
 }
 
+/// S08P NVM-model geometry for a part (emulator only).
+fn s08pLayout(d: lib_device.Device) lib.cpu08.S08pLayout {
+    return .{
+        .ctrl_base = d.flash_base,
+        .flash = .{
+            .{ .lo = d.flash_start, .hi = d.flash_end },
+            if (d.flash_start2) |s2| .{ .lo = s2, .hi = d.flash_end2 } else null,
+        },
+        .eeprom = if (d.eeprom) |e| .{ .lo = e.base_global, .hi = e.base_global + e.size - 1 } else null,
+        .ram_hi = d.ram_end,
+    };
+}
+
 /// Mirrors the reference host's adaptRequiredBdmOptions: RESET signal for
 /// HCS12-family, speed-guess only for HC12, auto-reconnect = always.
 fn optionsForTarget(flags: *const Flags) session.Options {
@@ -611,7 +627,17 @@ fn optionsForTarget(flags: *const Flags) session.Options {
         opts.target_vdd = v;
         opts.leave_target_powered = true;
     }
+    if (sbdfrForPart(flags)) |a| opts.sbdfr_address = a;
     return opts;
+}
+
+/// A software reset is the pod writing SBDFR: 0x3001 on S08P, not the classic 0x1801.
+/// From --part; null keeps the pod's default.
+fn sbdfrForPart(flags: *const Flags) ?u16 {
+    const name = flags.part orelse return null;
+    const d = lib_device.lookup(name) orelse return null;
+    if (d.family != .hcs08) return null;
+    return @intCast(d.sbdfr_addr);
 }
 
 fn bringUp(bdm: *Bdm, flags: *const Flags) !void {
@@ -894,20 +920,53 @@ fn cmdConnect(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
     try printBdmStatus(bdm, out, st);
 }
 
-/// Read the family SDID register (SDIDH:SDIDL, big-endian u16). null on failure.
-fn readSdid(bdm: *Bdm, family: lib_device.Family) ?u16 {
+/// Read an SDID register (SDIDH:SDIDL, big-endian u16). null on failure.
+fn readSdidAt(bdm: *Bdm, addr: u32) ?u16 {
     var b: [2]u8 = undefined;
-    bdm.sess.readMem(.byte, lib_device.familySdidAddr(family), &b) catch return null;
+    bdm.sess.readMem(.byte, addr, &b) catch return null;
     return (@as(u16, b[0]) << 8) | b[1];
 }
 
-/// Count SDID matches for a family, returning the first. Many variants share an
-/// SDID (they differ only in flash size), so a single match can be ambiguous.
-fn sdidMatches(fam: lib_device.Family, sdid: u16) struct { first: ?lib_device.SdidEntry, count: usize } {
+const SdidRead = struct { addr: u32, sdid: u16 };
+
+/// Find the target's SDID: HCS08 parts keep it at 0x1806 (classic) or 0x3002 (S08P),
+/// so try the --part's address, then each address the family uses; the first read
+/// that matches a known part wins. With no match, the first read is returned.
+fn readSdid(bdm: *Bdm, flags: *const Flags, fam: lib_device.Family) ?SdidRead {
+    var buf: [8]u32 = undefined;
+    var n: usize = 0;
+    if (flags.part) |name| {
+        if (lib_device.lookup(name)) |d| {
+            if (d.family == fam) {
+                buf[0] = lib_device.sdidAddrFor(d);
+                n = 1;
+            }
+        }
+    }
+    var more: [7]u32 = undefined;
+    for (lib_device.sdidAddrs(fam, &more)) |a| {
+        if (std.mem.indexOfScalar(u32, buf[0..n], a) == null and n < buf.len) {
+            buf[n] = a;
+            n += 1;
+        }
+    }
+    var first: ?SdidRead = null;
+    for (buf[0..n]) |a| {
+        const v = readSdidAt(bdm, a) orelse continue;
+        if (first == null) first = .{ .addr = a, .sdid = v };
+        if (lib_device.identifyAt(fam, a, v) != null) return .{ .addr = a, .sdid = v };
+    }
+    return first;
+}
+
+/// Count SDID matches for a family at an SDID address, returning the first. Many
+/// variants share an SDID (they differ only in flash size), so a single match can
+/// be ambiguous.
+fn sdidMatches(fam: lib_device.Family, addr: u32, sdid: u16) struct { first: ?lib_device.SdidEntry, count: usize } {
     var first: ?lib_device.SdidEntry = null;
     var count: usize = 0;
     for (lib_device.sdid_table) |e| {
-        if (e.family != fam) continue;
+        if (e.family != fam or e.sdid_addr != addr) continue;
         if (sdid & e.mask != e.sdid) continue;
         if (first == null) first = e;
         count += 1;
@@ -918,8 +977,9 @@ fn sdidMatches(fam: lib_device.Family, sdid: u16) struct { first: ?lib_device.Sd
 /// Print the SDID and the part(s) it identifies (informational; silent on failure).
 fn reportDetected(bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) void {
     const fam = familyOfTarget(flags.target);
-    const sdid = readSdid(bdm, fam) orelse return;
-    const m = sdidMatches(fam, sdid);
+    const r = readSdid(bdm, flags, fam) orelse return;
+    const sdid = r.sdid;
+    const m = sdidMatches(fam, r.addr, sdid);
     if (m.first) |e| {
         var extra: [24]u8 = undefined;
         const more = if (m.count > 1) (std.fmt.bufPrint(&extra, " +{d} sharing SDID", .{m.count - 1}) catch "") else "";
@@ -936,15 +996,16 @@ fn cmdIdentify(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *I
     _ = arena;
     try bringUp(bdm, flags);
     const fam = familyOfTarget(flags.target);
-    const addr = lib_device.familySdidAddr(fam);
-    const sdid = readSdid(bdm, fam) orelse {
-        try out.print("could not read the SDID register at 0x{X}\n", .{addr});
+    const r = readSdid(bdm, flags, fam) orelse {
+        try out.print("could not read the SDID register at 0x{X}\n", .{lib_device.familySdidAddr(fam)});
         return;
     };
+    const addr = r.addr;
+    const sdid = r.sdid;
     try out.print("SDID 0x{X:0>4} @ 0x{X}\n", .{ sdid, addr });
     var n: usize = 0;
     for (lib_device.sdid_table) |e| {
-        if (e.family != fam or sdid & e.mask != e.sdid) continue;
+        if (e.family != fam or e.sdid_addr != addr or sdid & e.mask != e.sdid) continue;
         const geo = if (lib_device.lookup(e.name) != null) "" else "  (no built-in geometry)";
         try out.print("  {s}{s}{s}{s}\n", .{ st.bold, e.name, st.reset, geo });
         n += 1;
@@ -963,6 +1024,9 @@ fn cmdReset(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.W
         opts.target_vdd = v;
         opts.leave_target_powered = true;
     }
+    // Without this an S08P software reset writes the classic SBDFR (0x1801), which
+    // the part doesn't have: the "reset" silently does nothing.
+    if (sbdfrForPart(flags)) |a| opts.sbdfr_address = a;
     try bdm.sess.setOptions(opts);
     try bdm.sess.setTarget(flags.target);
     try bdm.sess.reset(flags.reset_mode, flags.reset_method);
@@ -1351,6 +1415,11 @@ const lib_device = lib.device;
 // Vendored HCS08 small-code routines (embedded). 0xB0 variant: RAM above 0x80.
 const flash_blob_80 = @embedFile("flash_hcs08_0x80");
 const flash_blob_b0 = @embedFile("flash_hcs08_0xB0");
+// Vendored S08P (PA/PT/PL/PB) routines: PA2/PA4 small code; PTxx (PA8..PA60/PT/PL)
+// and PBxx large code with the HCS08 header layout.
+const flash_blob_s08p_small = @embedFile("flash_s08p_small");
+const flash_blob_s08p_ptxx = @embedFile("flash_s08p_ptxx");
+const flash_blob_s08p_pbxx = @embedFile("flash_s08p_pbxx");
 // Vendored HCS12 large-code routines. FTS = S12 MMCV4; GMMC = S12G FTMRG;
 // XMMC = S12XE XFTMRK (same large-code ABI as GMMC).
 const flash_blob_hcs12_fts = @embedFile("flash_hcs12_fts");
@@ -1503,6 +1572,7 @@ fn mapRoutineError(last: ramflash.DriverError, err: anyerror) noreturn {
         },
         error.Timeout => fatalCode(.bdm_error, "flash routine timed out (target never halted)", .{}),
         error.NoRamForData => fatalCode(.flash_error, "not enough target RAM for the flash-routine data buffer", .{}),
+        error.CodeDownloadFailed => fatalCode(.bdm_error, "flash routine download read back wrong twice (BDM link errors; is another program using this BDM or its USB hub?)", .{}),
         error.NotSmallCode, error.BadImage => fatalCode(.flash_error, "flash-routine image is malformed", .{}),
         else => fatalCode(.flash_error, "flash operation failed: {s}", .{@errorName(err)}),
     }
@@ -1674,15 +1744,25 @@ fn prepareHcs08(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, d: lib
         .bus_hz = flags.bus_hz,
         .strict = strict,
     }, image) catch |err| switch (err) {
-        error.NoFlashDivider => fatal("no flash clock divider fits this bus clock (the flash needs 150-200 kHz); pass --bus-hz if the measurement is wrong", .{}),
-        error.FcdivNotLoaded => fatal("FCDIV did not load: it was already written since the last reset, so the target was not reset cleanly (the firmware ran before the halt)", .{}),
+        error.NoFlashDivider => if (d.hcs08_routine.isS08p())
+            fatal("no flash clock divider fits this bus clock (S08P flash needs a 1-20 MHz bus for its ~1 MHz flash clock); pass --bus-hz if the measurement is wrong", .{})
+        else
+            fatal("no flash clock divider fits this bus clock (the flash needs 150-200 kHz); pass --bus-hz if the measurement is wrong", .{}),
+        error.FcdivNotLoaded => if (d.hcs08_routine.isS08p())
+            fatal("FCLKDIV did not take the divider: FDIVLCK is set, so firmware ran and locked it before the halt (the reset was not clean)", .{})
+        else
+            fatal("FCDIV did not load: it was already written since the last reset, so the target was not reset cleanly (the firmware ran before the halt)", .{}),
         error.TrimNotSupported => fatal("--trim needs an HCS08 part with an ICS clock; pass --part (this device's clock is '{s}')", .{@tagName(d.clock)}),
         error.BadTrimLocation => fatal("the trim location is not in {s} flash; check --nvloc", .{d.name}),
         error.TrimOutOfRange => fatal("the clock cannot be trimmed to {d:.3} kHz: the search ran off the end of the trim range", .{@as(f64, @floatFromInt(flags.trim_hz orelse 0)) / 1000.0}),
         else => fatal("HCS08 flash bring-up failed: {s}", .{@errorName(err)}),
     };
 
-    out.print("{s}special reset, COP off, bus clock {d}.{d:0>3} MHz, FCDIV 0x{x:0>2}{s}\n", .{
+    if (d.hcs08_routine.isS08p()) {
+        out.print("{s}special reset (SBDFR 0x{x:0>4}), bus clock {d}.{d:0>3} MHz, FCLKDIV 0x{x:0>2}{s}\n", .{
+            st.dim, d.sbdfr_addr, res.bus_hz / 1_000_000, (res.bus_hz % 1_000_000) / 1000, res.fcdiv | 0x80, st.reset,
+        }) catch {};
+    } else out.print("{s}special reset, COP off, bus clock {d}.{d:0>3} MHz, FCDIV 0x{x:0>2}{s}\n", .{
         st.dim, res.bus_hz / 1_000_000, (res.bus_hz % 1_000_000) / 1000, res.fcdiv | 0x80, st.reset,
     }) catch {};
     if (res.trim) |t| {
@@ -1721,11 +1801,21 @@ fn flashPrepFor(arena: std.mem.Allocator, d: lib_device.Device, bus_hz: u32) Fla
         .alignment = d.write_align,
     };
     switch (d.family) {
-        .hcs08 => {
-            const blob = if (d.routineLoadAddress() == 0xB0) flash_blob_b0 else flash_blob_80;
-            const parsed = ramflash.parseSmall(arena, blob) catch |err|
-                fatal("cannot load flash routine: {s}", .{@errorName(err)});
-            return .{ .routine = .{ .small = parsed.routine }, .params = params, .pc_reg = @intFromEnum(target.Hcs08Reg.pc) };
+        .hcs08 => switch (d.hcs08_routine) {
+            .classic, .s08p_small => {
+                const blob = if (d.hcs08_routine == .s08p_small)
+                    flash_blob_s08p_small
+                else if (d.routineLoadAddress() == 0xB0) flash_blob_b0 else flash_blob_80;
+                const parsed = ramflash.parseSmall(arena, blob) catch |err|
+                    fatal("cannot load flash routine: {s}", .{@errorName(err)});
+                return .{ .routine = .{ .small = parsed.routine }, .params = params, .pc_reg = @intFromEnum(target.Hcs08Reg.pc) };
+            },
+            .s08p_ptxx, .s08p_pbxx => {
+                const blob = if (d.hcs08_routine == .s08p_ptxx) flash_blob_s08p_ptxx else flash_blob_s08p_pbxx;
+                const routine = ramflash.parseLarge08(arena, blob) catch |err|
+                    fatal("cannot load S08P flash routine: {s}", .{@errorName(err)});
+                return .{ .routine = .{ .large = routine }, .params = params, .pc_reg = @intFromEnum(target.Hcs08Reg.pc) };
+            },
         },
         .hcs12 => {
             const blob = switch (d.hcs12_routine) {
@@ -1781,10 +1871,30 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
 
     const d = resolveDevice(flags);
+    const s08p_part = d.family == .hcs08 and d.hcs08_routine.isS08p();
+    // S08P images (CodeWarrior) put EEPROM data at its CPU address (0x3100..): split
+    // it off and program it after the flash, with the EEPROM geometry.
+    var ee_image: hexfile.Image = .{ .segments = &.{} };
+    if (s08p_part) {
+        if (d.eeprom) |ee| {
+            var fl: std.ArrayList(hexfile.Segment) = .empty;
+            var es: std.ArrayList(hexfile.Segment) = .empty;
+            for (image.segments) |seg| {
+                if (seg.data.len == 0) continue;
+                const seg_end = seg.addr + @as(u32, @intCast(seg.data.len - 1));
+                const in_ee = seg.addr >= ee.base_global and seg_end < ee.base_global + ee.size;
+                try (if (in_ee) &es else &fl).append(arena, seg);
+            }
+            image = .{ .segments = try fl.toOwnedSlice(arena) };
+            ee_image = .{ .segments = try es.toOwnedSlice(arena) };
+        }
+    }
     // An erased security byte reads 0xFF = SECURED. When the image rewrites the
     // sector it lives in but does not define it (S12 images usually leave
     // 0xFF00-0xFF0F out), program the unsecured value so the part stays debuggable.
-    if (d.family == .hcs12) {
+    // S08P likewise (NV_FSEC at 0xFF7F, the flash configuration field), as USBDM's
+    // default "smart" security handling does.
+    if (d.family == .hcs12 or s08p_part) {
         const sec_sector = d.security_addr & ~(d.page_size - 1);
         if (image.overlaps(sec_sector, sec_sector + d.page_size - 1) and !image.overlaps(d.security_addr, d.security_addr)) {
             const val = lib_device.unsecuredSecurityByte(d.family);
@@ -1804,8 +1914,11 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
             fatal("image segment 0x{x:0>4}..0x{x:0>4} is outside {s} flash (or straddles a gap between flash ranges)", .{ seg.addr, seg_end, d.name });
         }
     }
-    if (image.totalBytes() == 0) fatal("'{s}' contains no data to program", .{path});
-    if (!confirm(out, st, flags.force, "program {d} bytes to {s} flash (erases affected sectors)?", .{ image.totalBytes(), d.name }))
+    if (image.totalBytes() + ee_image.totalBytes() == 0) fatal("'{s}' contains no data to program", .{path});
+    if (ee_image.totalBytes() != 0) {
+        if (!confirm(out, st, flags.force, "program {d} bytes to {s} flash and {d} bytes to its EEPROM (erases affected sectors)?", .{ image.totalBytes(), d.name, ee_image.totalBytes() }))
+            fatal("aborted", .{});
+    } else if (!confirm(out, st, flags.force, "program {d} bytes to {s} flash (erases affected sectors)?", .{ image.totalBytes(), d.name }))
         fatal("aborted", .{});
 
     // HCS08: also inserts the trim bytes (--trim) or carries the chip's own over.
@@ -1827,6 +1940,38 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
             try out.print("  {s}verified{s}\n", .{ st.dim, st.reset });
         }
     }
+    if (ee_image.totalBytes() != 0) try programEepromSegments(prep, &rt, d.eeprom.?, ee_image, false, flags, out, st);
+}
+
+/// Erase, program and verify EEPROM segments with the EEPROM geometry (alignment,
+/// erase sector) and the routine's EEPROM routing flag. `offsets`: segment addresses
+/// are 0-based EEPROM offsets (the `eeprom` command) rather than CPU addresses.
+fn programEepromSegments(prep_in: FlashPrep, rt: *RamTarget, ee: lib_device.Eeprom, image: hexfile.Image, offsets: bool, flags: *const Flags, out: *Io.Writer, st: tty.Style) !void {
+    var prep = prep_in;
+    prep.params.alignment = ee.align_bytes;
+    prep.params.sector_size = @intCast(ee.sector);
+    var drv = prep.driver(rt.iface());
+    const E = struct {
+        fn addr(e: lib_device.Eeprom, a: u32, off: bool) u32 {
+            return e.addr_flag | (if (off) e.base_global + a else a);
+        }
+    };
+    for (image.segments) |seg| {
+        if (seg.data.len == 0) continue;
+        drv.eraseRange(E.addr(ee, seg.addr, offsets), @intCast(seg.data.len)) catch |err| mapRoutineError(drv.lastError(), err);
+    }
+    for (image.segments) |seg| {
+        if (seg.data.len == 0) continue;
+        drv.program(E.addr(ee, seg.addr, offsets), seg.data) catch |err| mapRoutineError(drv.lastError(), err);
+        if (offsets)
+            try out.print("{s}programmed {d} bytes at EEPROM+0x{x}{s}\n", .{ st.green, seg.data.len, seg.addr, st.reset })
+        else
+            try out.print("{s}programmed {d} bytes at 0x{x:0>4} (EEPROM){s}\n", .{ st.green, seg.data.len, seg.addr, st.reset });
+        if (!flags.no_verify) {
+            drv.verify(E.addr(ee, seg.addr, offsets), seg.data) catch |err| mapRoutineError(drv.lastError(), err);
+            try out.print("  {s}verified{s}\n", .{ st.dim, st.reset });
+        }
+    }
 }
 
 /// eeprom <file>: program EEPROM/data-flash; addresses are 0-based offsets.
@@ -1835,48 +1980,36 @@ fn cmdProgram(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io
 fn cmdEeprom(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) !void {
     const d = resolveDevice(flags);
     const ee = d.eeprom orelse
-        fatalCode(.usage, "--part '{s}' has no EEPROM programming support (only S12G GMMC parts, e.g. mc9s12g240)", .{d.name});
+        fatalCode(.usage, "--part '{s}' has no EEPROM programming support (S12G GMMC parts, e.g. mc9s12g240, and S08P PA8..PA60/PT/PL)", .{d.name});
     const path = flags.positionals[1];
     const bytes = Io.Dir.cwd().readFileAlloc(global_io, path, arena, .limited(1 * 1024 * 1024)) catch |err|
         fatalCode(.io_error, "cannot read '{s}': {s}", .{ path, @errorName(err) });
     const image = hexfile.parse(arena, bytes) catch |err|
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
 
+    // S08P EEPROM has a CPU address (0x3100..) that images use directly; offsets and
+    // absolute addresses don't overlap, so take either (all segments the same way).
+    const s08p_part = d.family == .hcs08 and d.hcs08_routine.isS08p();
+    var absolute = false;
+    if (s08p_part and image.segments.len > 0 and image.segments[0].addr >= ee.base_global) absolute = true;
     for (image.segments) |seg| {
         if (seg.data.len == 0) continue;
         const seg_end = seg.addr + @as(u32, @intCast(seg.data.len - 1));
-        if (seg_end >= ee.size)
+        if (absolute) {
+            if (seg.addr < ee.base_global or seg_end >= ee.base_global + ee.size)
+                fatalCode(.usage, "EEPROM segment 0x{x}..0x{x} is outside the EEPROM 0x{x}..0x{x}", .{ seg.addr, seg_end, ee.base_global, ee.base_global + ee.size - 1 });
+        } else if (seg_end >= ee.size)
             fatalCode(.usage, "EEPROM segment 0x{x}..0x{x} exceeds the {d}-byte EEPROM (address as a 0-based offset)", .{ seg.addr, seg_end, ee.size });
     }
     if (image.totalBytes() == 0) fatalCode(.io_error, "'{s}' contains no data to program", .{path});
     if (!confirm(out, st, flags.force, "program {d} bytes to {s} EEPROM (erases affected sectors)?", .{ image.totalBytes(), d.name }))
         fatal("aborted", .{});
 
-    // Flash routine/params, but EEPROM align+sector; bit-31 global addr → D-flash.
-    var prep = prepareFlash(arena, bdm, flags, out, st, null, true);
-    prep.params.alignment = ee.align_bytes;
-    prep.params.sector_size = @intCast(ee.sector);
+    // Flash routine/params, but EEPROM align+sector; the routing flag (S12G bit 31
+    // global -> D-flash, S08P bit 30 ADDRESS_EEPROM) picks the EEPROM commands.
+    const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
-    var drv = prep.driver(rt.iface());
-
-    const lin = struct {
-        fn addr(e: lib_device.Eeprom, off: u32) u32 {
-            return lib_device.eeprom_linear_flag | (e.base_global + off);
-        }
-    };
-    for (image.segments) |seg| {
-        if (seg.data.len == 0) continue;
-        drv.eraseRange(lin.addr(ee, seg.addr), @intCast(seg.data.len)) catch |err| mapRoutineError(drv.lastError(), err);
-    }
-    for (image.segments) |seg| {
-        if (seg.data.len == 0) continue;
-        drv.program(lin.addr(ee, seg.addr), seg.data) catch |err| mapRoutineError(drv.lastError(), err);
-        try out.print("{s}programmed {d} bytes at EEPROM+0x{x}{s}\n", .{ st.green, seg.data.len, seg.addr, st.reset });
-        if (!flags.no_verify) {
-            drv.verify(lin.addr(ee, seg.addr), seg.data) catch |err| mapRoutineError(drv.lastError(), err);
-            try out.print("  {s}verified{s}\n", .{ st.dim, st.reset });
-        }
-    }
+    try programEepromSegments(prep, &rt, ee, image, !absolute, flags, out, st);
 }
 
 fn cmdVerify(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) !void {
@@ -1886,15 +2019,52 @@ fn cmdVerify(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.
         fatalCode(.io_error, "cannot read '{s}': {s}", .{ path, @errorName(err) });
     var image = hexfile.parse(arena, bytes) catch |err|
         fatalCode(.io_error, "cannot parse '{s}': {s}", .{ path, @errorName(err) });
+    const d = resolveDevice(flags);
     // Same unit merge as `program`: a record padded out to its write unit alone
-    // would be compared against its neighbour's bytes.
-    image = hexfile.mergeSharedUnits(arena, image, resolveDevice(flags).write_align) catch |err|
+    // would be compared against its neighbour's bytes. Flash only: S08P EEPROM
+    // records are byte units and stay as they are.
+    var ee_segs: []hexfile.Segment = &.{};
+    if (d.family == .hcs08 and d.hcs08_routine.isS08p()) {
+        if (d.eeprom) |e| {
+            var fl: std.ArrayList(hexfile.Segment) = .empty;
+            var es: std.ArrayList(hexfile.Segment) = .empty;
+            for (image.segments) |seg| {
+                if (seg.data.len == 0) continue;
+                const seg_end = seg.addr + @as(u32, @intCast(seg.data.len - 1));
+                try (if (seg.addr >= e.base_global and seg_end < e.base_global + e.size) &es else &fl).append(arena, seg);
+            }
+            image = .{ .segments = try fl.toOwnedSlice(arena) };
+            ee_segs = try es.toOwnedSlice(arena);
+        }
+    }
+    image = hexfile.mergeSharedUnits(arena, image, d.write_align) catch |err|
         fatalCode(.io_error, "cannot prepare '{s}': {s}", .{ path, @errorName(err) });
+    if (ee_segs.len > 0) image = .{ .segments = try std.mem.concat(arena, hexfile.Segment, &.{ image.segments, ee_segs }) };
 
     const prep = prepareFlash(arena, bdm, flags, out, st, null, true);
     var rt = prep.ramTarget(&bdm.sess);
     var drv = prep.driver(rt.iface());
+    // S08P EEPROM segments (CPU address 0x3100..) compare with the EEPROM geometry:
+    // byte units and the routine's EEPROM flag, as `program` wrote them.
+    const ee: ?lib_device.Eeprom = if (d.family == .hcs08 and d.hcs08_routine.isS08p()) d.eeprom else null;
+    var ee_drv: ?AnyDriver = null;
+    if (ee) |e| {
+        var ep = prep;
+        ep.params.alignment = e.align_bytes;
+        ep.params.sector_size = @intCast(e.sector);
+        ee_drv = ep.driver(rt.iface());
+    }
     for (image.segments) |seg| {
+        if (seg.data.len == 0) continue;
+        const seg_end = seg.addr + @as(u32, @intCast(seg.data.len - 1));
+        if (ee) |e| {
+            if (seg.addr >= e.base_global and seg_end < e.base_global + e.size) {
+                var ed = &ee_drv.?;
+                ed.verify(e.addr_flag | seg.addr, seg.data) catch |err| mapRoutineError(ed.lastError(), err);
+                try out.print("{s}verified {d} bytes at 0x{x:0>4} (EEPROM){s}\n", .{ st.green, seg.data.len, seg.addr, st.reset });
+                continue;
+            }
+        }
         drv.verify(seg.addr, seg.data) catch |err| mapRoutineError(drv.lastError(), err);
         try out.print("{s}verified {d} bytes at 0x{x:0>4}{s}\n", .{ st.green, seg.data.len, seg.addr, st.reset });
     }
@@ -1933,10 +2103,24 @@ fn cmdErase(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.W
         const nv = lib.clock.defaultTrimNv(d.clock);
         if (d.family == .hcs08 and nv != 0 and nv >= addr and nv < addr + d.page_size) trimLostNote(d, out, st);
     } else {
-        drv.massErase(d.flash_start) catch |err| mapRoutineError(drv.lastError(), err);
-        try out.print("{s}mass erased{s}\n", .{ st.green, st.reset });
+        if (massEraseS08p(bdm, d)) |_| {
+            try out.print("{s}mass erased{s} (flash and EEPROM: S08P Erase All Blocks)\n", .{ st.green, st.reset });
+            try out.print("{s}note:{s} NV_FSEC (0x{x:0>4}) is erased too: the part is secured after the next reset; use 'unsecure' before programming\n", .{ st.dim, st.reset, d.security_addr });
+        } else {
+            drv.massErase(d.flash_start) catch |err| mapRoutineError(drv.lastError(), err);
+            try out.print("{s}mass erased{s}\n", .{ st.green, st.reset });
+        }
         trimLostNote(d, out, st);
     }
+}
+
+/// S08P parts: Erase All Blocks from the host (works secured, where the routine
+/// can't run). Returns whether FSEC then reads unsecured; null for other parts.
+fn massEraseS08p(bdm: *Bdm, d: lib_device.Device) ?bool {
+    if (!(d.family == .hcs08 and d.hcs08_routine.isS08p())) return null;
+    var ctx = lib.hcs08.Ctx{ .sess = &bdm.sess, .dev = d, .sleep_ms = lib.hcs08.sleepMs };
+    return lib.hcs08.s08pMassErase(&ctx) catch |err|
+        fatalCode(.flash_error, "S08P Erase All Blocks failed: {s} (FCLKDIV not loaded, or the part did not accept the command)", .{@errorName(err)});
 }
 
 fn cmdBlankCheck(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *Io.Writer, st: tty.Style) !void {
@@ -1970,7 +2154,11 @@ fn cmdUnsecure(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *I
     var drv = prep.driver(rt.iface());
     // Mass-erase leaves the security byte 0xFF (secured); program the unsecured
     // value (SEC=0b10) - its sector is now blank so program() can write it.
-    drv.massErase(d.flash_start) catch |err| mapRoutineError(drv.lastError(), err);
+    // S08P: Erase All Blocks from the host first (a secured part's RAM is closed to
+    // BDM, so the routine can only run once that has unsecured it).
+    if (massEraseS08p(bdm, d)) |unsecured| {
+        if (!unsecured) fatalCode(.flash_error, "S08P Erase All Blocks completed but FSEC still reads secured; reset and retry", .{});
+    } else drv.massErase(d.flash_start) catch |err| mapRoutineError(drv.lastError(), err);
     drv.program(d.security_addr, &.{val}) catch |err| mapRoutineError(drv.lastError(), err);
     try out.print("{s}unsecured{s} (mass-erased, security@0x{x:0>4} = 0x{x:0>2}); power-cycle the target\n", .{
         st.green, st.reset, d.security_addr, val,
@@ -2451,6 +2639,14 @@ const Gdb = struct {
                 break :hz if (sync > 1) session.syncToHz(sync) else 0;
             };
             if (bus_hz == 0) break :flash_blk false;
+            // S08P routines need FCLKDIV loaded (the reference initFlash); no reset here.
+            if (d.family == .hcs08 and d.hcs08_routine.isS08p()) {
+                var ctx = lib.hcs08.Ctx{ .sess = &bdm.sess, .dev = d, .sleep_ms = lib.hcs08.sleepMs };
+                _ = lib.hcs08.initS08pFlash(&ctx, (bus_hz + 500) / 1000) catch |err| {
+                    out.print("{s}note:{s} S08P flash init failed ({s}); gdb load to flash disabled\n", .{ st.yellow, st.reset, @errorName(err) }) catch {};
+                    break :flash_blk false;
+                };
+            }
             gt.flash = flashPrepFor(arena, d, bus_hz);
             gt.memory_map = memoryMapXml(arena, d) catch {
                 gt.flash = null; // keep flash hooks off if the map build failed
@@ -3441,4 +3637,268 @@ test "gmmcFlashDivider follows the FTMRCK reference script" {
     try std.testing.expectEqual(@as(?u8, 0), gmmcFlashDivider(1000));
     try std.testing.expectEqual(@as(?u8, null), gmmcFlashDivider(500));
     try std.testing.expectEqual(@as(?u8, null), gmmcFlashDivider(100000)); // beyond FDIV
+}
+
+// --- S08P (PA/PT/PL/PB): the real vendored routines on the CPU08 core + FCCOB model ---
+
+test "e2e S08P PTxx: the REAL routine erases, programs, verifies flash and EEPROM on the emulator" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const d = lib_device.lookup("mc9s08pa60").?;
+    var cpu = try lib.cpu08.Cpu.initS08p(gpa, s08pLayout(d));
+    defer cpu.deinit();
+    cpu.hostWrite(0x3020, &.{0x07}); // FCLKDIV for an 8 MHz bus, as bring-up loads it
+    var et = EmuTarget{ .cpu = &cpu };
+    const prep = flashPrepFor(arena, d, 8_000_000);
+    try std.testing.expect(prep.routine == .large);
+    var drv = prep.driver(et.iface());
+
+    // Odd start and length: the driver widens to 4-byte phrases, padding with 0xFF.
+    const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    try drv.eraseRange(0xC001, data.len);
+    try drv.program(0xC001, &data); // blank-check + program + the routine's verify
+    try std.testing.expectEqualSlices(u8, &data, cpu.mem[0xC001..0xC00C]);
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0xC000]);
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0xC00C]);
+    try drv.verify(0xC001, &data);
+    // The routine's own compare catches a wrong byte.
+    cpu.mem[0xC005] = 0x00;
+    try std.testing.expectError(error.RoutineError, drv.verify(0xC001, &data));
+    try std.testing.expectEqual(ramflash.DriverError.verify_failed, drv.lastError());
+    try std.testing.expectError(error.RoutineError, drv.blankCheck(0xC000, 512));
+    try std.testing.expectEqual(ramflash.DriverError.erase_failed, drv.lastError());
+    try drv.eraseRange(0xC000, 512);
+    try drv.blankCheck(0xC000, 512);
+
+    // The low window of PA60's split map, then a block erase of all flash.
+    try drv.program(0x1040, &.{ 0xAA, 0xBB, 0xCC, 0xDD });
+    try std.testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC, 0xDD }, cpu.mem[0x1040..0x1044]);
+    try drv.massErase(d.flash_start);
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0x1040]);
+
+    // EEPROM: the routine's ADDRESS_EEPROM flag, byte alignment, 2-byte sectors.
+    const ee = d.eeprom.?;
+    var ep = prep;
+    ep.params.alignment = ee.align_bytes;
+    ep.params.sector_size = @intCast(ee.sector);
+    var edrv = ep.driver(et.iface());
+    cpu.mem[0x3104] = 0x00; // shares a sector with the first byte: erased with it
+    try edrv.eraseRange(ee.addr_flag | 0x3105, 3);
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0x3104]);
+    try edrv.program(ee.addr_flag | 0x3105, &.{ 0x5A, 0xA5, 0x3C });
+    try std.testing.expectEqualSlices(u8, &.{ 0x5A, 0xA5, 0x3C }, cpu.mem[0x3105..0x3108]);
+    try edrv.verify(ee.addr_flag | 0x3105, &.{ 0x5A, 0xA5, 0x3C });
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0xC000]); // flash untouched by EEPROM ops
+}
+
+test "e2e S08P PTxx on PA32 at the bench clock: sector erase stays inside the memory map" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const d = lib_device.lookup("mc9s08pa32").?;
+    var cpu = try lib.cpu08.Cpu.initS08p(gpa, s08pLayout(d));
+    defer cpu.deinit();
+    cpu.hostWrite(0x3020, &.{0x88}); // FCLKDIV as loaded on the bench (8.7 MHz bus)
+    var et = EmuTarget{ .cpu = &cpu };
+    const prep = flashPrepFor(arena, d, 8_707_000);
+    var drv = prep.driver(et.iface());
+    try drv.program(0xF000, &.{ 1, 2, 3, 4 });
+    const r = drv.eraseRange(0xF000, 512);
+    if (cpu.ilad_addr) |a| std.debug.print("ILAD at 0x{X:0>4}, pc 0x{X:0>4}\n", .{ a, cpu.ilad_pc });
+    try r;
+    try std.testing.expectEqual(@as(?u16, null), cpu.ilad_addr);
+    try drv.blankCheck(0xF000, 512);
+}
+
+test "e2e S08P PBxx: the REAL routine programs; verify falls back to readback (no verify op)" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const d = lib_device.lookup("mc9s08pb16").?;
+    var cpu = try lib.cpu08.Cpu.initS08p(gpa, s08pLayout(d));
+    defer cpu.deinit();
+    cpu.hostWrite(0x3020, &.{0x07});
+    var et = EmuTarget{ .cpu = &cpu };
+    const prep = flashPrepFor(arena, d, 8_000_000);
+    try std.testing.expect(prep.routine.large.capabilities & ramflash.CAP_VERIFY_RANGE == 0);
+    var drv = prep.driver(et.iface());
+    const data = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02 };
+    try drv.eraseRange(0xC000, data.len);
+    try drv.program(0xC000, &data);
+    try std.testing.expectEqualSlices(u8, &data, cpu.mem[0xC000..0xC006]);
+    try drv.verify(0xC000, &data);
+    cpu.mem[0xC001] = 0x00;
+    try std.testing.expectError(error.RoutineError, drv.verify(0xC000, &data));
+    try std.testing.expectEqual(ramflash.DriverError.verify_failed, drv.lastError());
+    try drv.eraseRange(0xC000, 512);
+    try drv.blankCheck(0xC000, 512);
+}
+
+test "e2e S08P PA2/PA4: the REAL small-code routine programs padded phrases" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const d = lib_device.lookup("mc9s08pa4").?;
+    var cpu = try lib.cpu08.Cpu.initS08p(gpa, s08pLayout(d));
+    defer cpu.deinit();
+    cpu.hostWrite(0x3020, &.{0x07});
+    var et = EmuTarget{ .cpu = &cpu };
+    const prep = flashPrepFor(arena, d, 8_000_000);
+    try std.testing.expect(prep.routine == .small);
+    try std.testing.expectEqual(@as(u32, 0x40), prep.routine.small.load_address);
+    var drv = prep.driver(et.iface());
+    // 5 bytes at an odd address: two padded 4-byte phrases. Unpadded, the routine's
+    // count-down-by-4 loop would never reach zero.
+    const data = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50 };
+    try drv.eraseRange(0xF001, data.len);
+    try drv.program(0xF001, &data);
+    try std.testing.expectEqualSlices(u8, &data, cpu.mem[0xF001..0xF006]);
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0xF000]);
+    try std.testing.expectEqual(@as(u8, 0xFF), cpu.mem[0xF006]);
+    try drv.verify(0xF001, &data); // no verify op: readback
+    try std.testing.expectError(error.RoutineError, drv.blankCheck(0xF000, 512));
+    try drv.massErase(d.flash_start);
+    try drv.blankCheck(0xF000, 512);
+}
+
+/// A simulated PA60 with the real CPU08 core, the FCCOB model and an ICSV4 clock, plus a
+/// session on it with the part's SBDFR.
+const S08pRig = struct {
+    sim: Sim,
+    cpu: lib.cpu08.Cpu,
+    s: session.Session,
+    d: lib_device.Device,
+
+    fn init(gpa: std.mem.Allocator, rig: *S08pRig, part: []const u8) !void {
+        rig.d = lib_device.lookup(part).?;
+        rig.sim = Sim.init(gpa, rig.d);
+        rig.cpu = try lib.cpu08.Cpu.initS08p(gpa, s08pLayout(rig.d));
+        rig.sim.cpu = .{ .hcs08 = &rig.cpu };
+        rig.sim.ics = lib.sim.IcsModel.icsV4(rig.d.clock_addr);
+        rig.s = session.Session.init(rig.sim.asTransport(.{}));
+        _ = rig.s.capabilities() catch {};
+        try rig.s.setOptions(lib.hcs08.optionsFor(.{}, rig.d));
+        try rig.s.setTarget(.hcs08);
+        try rig.s.connect();
+    }
+    fn deinit(rig: *S08pRig) void {
+        rig.cpu.deinit();
+        rig.sim.deinit();
+    }
+    fn ctx(rig: *S08pRig) lib.hcs08.Ctx {
+        return .{ .sess = &rig.s, .dev = rig.d, .sleep_ms = noSleepP };
+    }
+    fn noSleepP(_: u32) void {}
+};
+
+test "S08P bring-up: FCLKDIV gates the routine; prepare loads it and leaves the WDOG alone" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: S08pRig = undefined;
+    try S08pRig.init(gpa, &rig, "mc9s08pa60");
+    defer rig.deinit();
+    try std.testing.expectEqual(@as(u16, 0x3001), lib.hcs08.optionsFor(.{}, rig.d).sbdfr_address);
+
+    const prep = flashPrepFor(arena, rig.d, 8_000_000);
+    var rt = prep.ramTarget(&rig.s);
+    var drv = prep.driver(rt.iface());
+    const data = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    // Fresh reset, FCLKDIV unwritten: the controller refuses (ACCERR). The routine's
+    // own error check misses it (upstream tests FSTAT with BIT $05, not BIT #...), so
+    // it is the program op's verify step that fails.
+    try std.testing.expectError(error.RoutineError, drv.program(0xE000, &data));
+    try std.testing.expectEqual(ramflash.DriverError.verify_failed, drv.lastError());
+
+    var ctx = rig.ctx();
+    var img = hexfile.Image{ .segments = &.{} };
+    const res = try lib.hcs08.prepare(arena, &ctx, .{}, &img);
+    try std.testing.expect(res.bus_hz > 7_000_000 and res.bus_hz < 9_500_000); // FEI, BDIV /2
+    try std.testing.expectEqual(lib.clock.s08pFlashDivider((res.bus_hz + 500) / 1000).?, res.fcdiv);
+    var b: [1]u8 = undefined;
+    try rig.s.readMem(.byte, 0x3020, &b);
+    try std.testing.expectEqual(@as(u8, 0x80 | res.fcdiv), b[0]);
+    try rig.s.readMem(.byte, 0x3028, &b);
+    try std.testing.expectEqual(@as(u8, 0xFF), b[0]); // FPROT open
+    try std.testing.expectEqual(@as(u8, 0), rig.cpu.mem[0x3030]); // WDOG_CS1 never written
+
+    var drv2 = prep.driver(rt.iface());
+    try drv2.eraseRange(0xE000, 512);
+    try drv2.program(0xE000, &data);
+    try drv2.verify(0xE000, &data);
+    try std.testing.expectEqualSlices(u8, &data, rig.cpu.mem[0xE000..0xE004]);
+}
+
+test "S08P --trim: ICSV4 search lands on the target and the bytes go to 0xFF6E/0xFF6F" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: S08pRig = undefined;
+    try S08pRig.init(gpa, &rig, "mc9s08pa16");
+    defer rig.deinit();
+    var ctx = rig.ctx();
+    var seg = [_]hexfile.Segment{.{ .addr = 0xFE00, .data = try arena.dupe(u8, &.{ 1, 2, 3, 4 }) }};
+    var image = hexfile.Image{ .segments = &seg }; // rewrites the trim bytes' sector
+    const res = try lib.hcs08.prepare(arena, &ctx, .{ .trim_hz = 31_250 }, &image);
+    const t = res.trim.?;
+    // The model's reference at the found trim, against the request.
+    const irc = 31_900.0 * (1.0 - 0.0019 * (@as(f64, @floatFromInt(t.value)) - 256.0));
+    try std.testing.expect(@abs(irc - 31_250.0) < 31_250.0 * 0.002);
+    try std.testing.expectEqual(@as(u32, 0xFF6E), res.trim_bytes.?.ftrim_addr);
+    try std.testing.expectEqual(@as(u8, @intCast(t.value >> 1)), image.byteAt(0xFF6F).?);
+}
+
+test "S08P unsecure: host Erase All Blocks opens a secured part, then the routine writes FSEC" {
+    const gpa = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var rig: S08pRig = undefined;
+    try S08pRig.init(gpa, &rig, "mc9s08pa32");
+    defer rig.deinit();
+    // Secured part: NV_FSEC erased, reset copies it to FSEC; some code in flash.
+    rig.cpu.mem[0xFF7F] = 0xFF;
+    rig.cpu.mem[0x9000] = 0x12;
+    rig.cpu.mem[0x3100] = 0x34;
+    rig.cpu.resetFlashRegs();
+    var ctx = rig.ctx();
+    _ = try lib.hcs08.prepare(arena, &ctx, .{ .strict = false }, null);
+    var b: [1]u8 = undefined;
+    try rig.s.readMem(.byte, 0x3021, &b);
+    try std.testing.expect(b[0] & 0x03 != 0x02); // secured
+
+    try std.testing.expect(try lib.hcs08.s08pMassErase(&ctx)); // unsecured until reset
+    try std.testing.expectEqual(@as(u8, 0xFF), rig.cpu.mem[0x9000]);
+    try std.testing.expectEqual(@as(u8, 0xFF), rig.cpu.mem[0x3100]); // EEPROM too
+
+    const prep = flashPrepFor(arena, rig.d, 8_000_000);
+    var rt = prep.ramTarget(&rig.s);
+    var drv = prep.driver(rt.iface());
+    try drv.program(rig.d.security_addr, &.{lib_device.unsecuredSecurityByte(.hcs08)});
+    try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF, 0xFF, 0xFE }, rig.cpu.mem[0xFF7C..0xFF80]);
+    rig.cpu.resetFlashRegs(); // next reset: NV_FSEC says unsecured
+    try rig.s.readMem(.byte, 0x3021, &b);
+    try std.testing.expectEqual(@as(u8, 0x02), b[0] & 0x03);
+}
+
+test "e2e S08P SDID: the sim serves PA60's SDID at 0x3002 and it identifies there only" {
+    const gpa = std.testing.allocator;
+    const d = lib_device.lookup("mc9s08pa60").?;
+    var sim = Sim.init(gpa, d);
+    defer sim.deinit();
+    var s = session.Session.init(sim.asTransport(.{}));
+    try s.connect();
+    var b: [2]u8 = undefined;
+    try s.readMem(.byte, 0x3002, &b);
+    const sdid = (@as(u16, b[0]) << 8) | b[1];
+    const e = lib_device.identifyAt(.hcs08, 0x3002, sdid) orelse return error.NotFound;
+    try std.testing.expect(std.mem.startsWith(u8, e.name, "mc9s08p"));
+    try std.testing.expectEqual(@as(?lib_device.SdidEntry, null), lib_device.identifyAt(.hcs08, 0x1806, sdid & 0x0FFF));
 }

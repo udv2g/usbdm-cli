@@ -161,12 +161,25 @@ const Defaults = struct {
     alignv: u64,
     copctl: u64,
     sopt: u64,
+    sbdfr: u64,
     routine: ?[]const u8,
 };
 
 const Win = struct { start: u64, end: u64 };
 
 const SUP_HCS08 = [_][]const u8{ "HCS08-default-flash-program", "HCS08-small-flash-program", "HCS08-alt-load-flash-program" };
+// S08P ("HCS08Plus") routines: FCCOB controller at 0x3020, register map at 0x30xx.
+const S08P_SMALL = "HCS08-PAxx-small-flash-program";
+const S08P_PTXX = "HCS08-PTxx-flash-program";
+const S08P_PBXX = "HCS08-PBxx-flash-program";
+const SUP_S08P = [_][]const u8{ S08P_SMALL, S08P_PTXX, S08P_PBXX };
+
+/// Device-DB family names folded into one of ours: the S08P parts are tagged
+/// "HCS08Plus" but are HCS08 cores on the same BDM.
+fn familyMatches(fam: Family, name: []const u8) bool {
+    if (std.mem.eql(u8, name, fam.tag())) return true;
+    return fam == .hcs08 and std.mem.eql(u8, name, "HCS08Plus");
+}
 const MMCV4 = [_][]const u8{ "HCS12-MMCV4-FTS-flash-program", "HCS12-MMCV4-FTS_2-flash-program", "HCS12-MMCV4-FTS_T-flash-program" };
 const GMMC = "HCS12-GMMC-FTMRG-flash-program";
 const GMMC_EE = "HCS12-GMMC-FTMRG-eeprom-program";
@@ -313,6 +326,7 @@ fn parseDefaults(ctx: *Ctx) void {
             .alignv = if (attr(fa, "alignment")) |x| parseNum(x) else 1,
             .copctl = if (elemAttr(d.body, "copctlAddress", "value")) |x| parseNum(x) else 0,
             .sopt = if (elemAttr(d.body, "soptAddress", "value")) |x| parseNum(x) else 0,
+            .sbdfr = if (elemAttr(d.body, "sbdfrAddress", "value")) |x| parseNum(x) else 0x1801,
             .routine = deviceRoutine(ctx, d.body),
         };
         return;
@@ -377,7 +391,7 @@ fn processFile(
 
         // alias inherits target's family
         const eff_family = if (target) |t| (t.family orelse d.family) else d.family;
-        if (eff_family == null or !std.mem.eql(u8, eff_family.?, fam.tag())) {
+        if (eff_family == null or !familyMatches(fam, eff_family.?)) {
             stats.skip_family += 1;
             continue;
         }
@@ -387,7 +401,24 @@ fn processFile(
         // tbody: target's body, for inherited fields
         const tbody: []const u8 = if (target) |t| t.body else "";
 
-        var routine = deviceRoutine(&ctx, d.body);
+        // alias with no own flash block uses target's geometry
+        var gbody = d.body;
+        {
+            var fl: std.ArrayList(Block) = .empty;
+            memBlocks(&ctx, d.body, "flash", &fl);
+            if (fl.items.len == 0 and target != null) gbody = tbody;
+        }
+
+        // A flashProgramRef inside the flash <memory> block is that region's routine
+        // and wins over the device's (USBDM loadTargetProgram(memoryRegion)); PA2/PA4
+        // carry theirs there. Then the device's, its alias target's, the default's.
+        var routine: ?[]const u8 = blk: {
+            var fl: std.ArrayList(Block) = .empty;
+            memBlocks(&ctx, gbody, "flash", &fl);
+            if (fl.items.len > 0) break :blk elemAttr(fl.items[0].body, "flashProgramRef", "ref");
+            break :blk null;
+        };
+        if (routine == null) routine = deviceRoutine(&ctx, d.body);
         if (routine == null and target != null) routine = deviceRoutine(&ctx, tbody);
         if (routine == null) routine = ctx.def.routine;
         const rt = routine orelse "";
@@ -423,21 +454,13 @@ fn processFile(
         }
 
         const supported = switch (fam) {
-            .hcs08 => inList(&SUP_HCS08, rt),
+            .hcs08 => inList(&SUP_HCS08, rt) or inList(&SUP_S08P, rt),
             .hcs12 => inList(&MMCV4, rt) or std.mem.eql(u8, rt, GMMC) or std.mem.eql(u8, rt, XMMC),
             .cfv1 => inList(&SUP_CFV1, rt),
         };
         if (!supported) {
             stats.skip_routine += 1;
             continue;
-        }
-
-        // alias with no own flash block uses target's geometry
-        var gbody = d.body;
-        {
-            var fl: std.ArrayList(Block) = .empty;
-            memBlocks(&ctx, d.body, "flash", &fl);
-            if (fl.items.len == 0 and target != null) gbody = tbody;
         }
 
         var flashes: std.ArrayList(Block) = .empty;
@@ -618,6 +641,15 @@ fn processFile(
         var clock_tag: []const u8 = "external";
         var clock_addr: u64 = 0;
         var sopt_addr: u64 = 0;
+        var sbdfr_addr: u64 = 0x1801;
+        const s08p_routine: ?[]const u8 = if (fam != .hcs08) null else if (std.mem.eql(u8, rt, S08P_SMALL))
+            "s08p_small"
+        else if (std.mem.eql(u8, rt, S08P_PTXX))
+            "s08p_ptxx"
+        else if (std.mem.eql(u8, rt, S08P_PBXX))
+            "s08p_pbxx"
+        else
+            null;
         if (fam == .hcs08) {
             const cbody = if (scanElem(d.body, 0, "clock") != null or target == null) d.body else tbody;
             if (scanElem(cbody, 0, "clock")) |ce| {
@@ -630,6 +662,19 @@ fn processFile(
             } else if (target != null) {
                 if (elemAttr(tbody, "soptAddress", "value")) |x| sopt_addr = parseNum(x);
             }
+            sbdfr_addr = ctx.def.sbdfr;
+            if (elemAttr(d.body, "sbdfrAddress", "value")) |x| {
+                sbdfr_addr = parseNum(x);
+            } else if (target != null) {
+                if (elemAttr(tbody, "sbdfrAddress", "value")) |x| sbdfr_addr = parseNum(x);
+            }
+            // S08P: the DB's soptAddress is the watchdog (WDOG_CS1 at 0x3030, as
+            // USBDM's parser treats it: setWatchdogAddress). The routines refresh it;
+            // writing the classic SOPT1 value there would be a WDOG reconfiguration.
+            if (s08p_routine != null) {
+                watchdog = sopt_addr;
+                sopt_addr = 0;
+            }
         }
 
         var have_ee = false;
@@ -637,6 +682,28 @@ fn processFile(
         var ee_size: u64 = 0;
         var ee_sector: u64 = 0;
         var ee_align: u64 = 0;
+        if (s08p_routine != null and std.mem.eql(u8, s08p_routine.?, "s08p_ptxx")) {
+            // PTxx programs the EEPROM too (ADDRESS_EEPROM flag, same controller).
+            // An EEPROM block naming its own routine (PA2/PA4's separate small one)
+            // is not this one, so it is left out.
+            var ees: std.ArrayList(Block) = .empty;
+            memBlocks(&ctx, gbody, "eeprom", &ees);
+            if (ees.items.len > 0 and elemAttr(ees.items[0].body, "flashProgramRef", "ref") == null) {
+                const eb = ees.items[0];
+                const ereg = if (attr(eb.attrs, "registerAddress")) |x| parseNum(x) else flash_base;
+                if (ereg != flash_base) {
+                    stats.report("{s}: EEPROM controller 0x{X} != flash 0x{X}; EEPROM left out", .{ lname, ereg, flash_base });
+                } else if (scanElem(eb.body, 0, "memoryRange")) |e| {
+                    if (rangeStartEnd(e.attrs)) |w| {
+                        ee_base = w.start;
+                        ee_size = w.end - w.start + 1;
+                        ee_sector = if (attr(eb.attrs, "sectorSize")) |x| parseNum(x) else 2;
+                        ee_align = if (attr(eb.attrs, "alignment")) |x| parseNum(x) else 1;
+                        have_ee = true;
+                    }
+                }
+            }
+        }
         if (is_gmmc) {
             var ees: std.ArrayList(Block) = .empty;
             memBlocks(&ctx, gbody, "eeprom", &ees);
@@ -680,15 +747,18 @@ fn processFile(
         try table_w.print(", .page_size = {d}, .write_align = {d}", .{ page_size, write_align });
         try table_w.print(", .security_addr = 0x{X}, .watchdog_addr = 0x{X}", .{ sec, watchdog });
         try table_w.print(", .hcs12_routine = .{s}", .{hcs12_routine});
-        if (fam == .hcs08)
+        if (fam == .hcs08) {
             try table_w.print(", .clock = .{s}, .clock_addr = 0x{X}, .sopt_addr = 0x{X}", .{ clock_tag, clock_addr, sopt_addr });
+            try table_w.print(", .hcs08_routine = .{s}, .sbdfr_addr = 0x{X}", .{ s08p_routine orelse "classic", sbdfr_addr });
+        }
         if (have_paged) {
             try table_w.print(", .paged = .{{ .ppage_addr = 0x{X}, .page_first = 0x{X}, .page_last = 0x{X} }}", .{ page_addr, pg_first, pg_last });
         } else {
             try table_w.print(", .paged = null", .{});
         }
         if (have_ee) {
-            try table_w.print(", .eeprom = .{{ .base_global = 0x{X}, .size = 0x{X}, .sector = {d}, .align_bytes = {d} }}", .{ ee_base, ee_size, ee_sector, ee_align });
+            const flag: []const u8 = if (fam == .hcs08) "t.s08p_eeprom_flag" else "t.eeprom_linear_flag";
+            try table_w.print(", .eeprom = .{{ .base_global = 0x{X}, .size = 0x{X}, .sector = {d}, .align_bytes = {d}, .addr_flag = {s} }}", .{ ee_base, ee_size, ee_sector, ee_align, flag });
         } else {
             try table_w.print(", .eeprom = null", .{});
         }

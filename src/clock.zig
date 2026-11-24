@@ -98,6 +98,20 @@ pub fn flashDivider(bus_khz: u32) ?u8 {
     return @intCast(div);
 }
 
+/// S08P (PA/PT/PL/PB) FCLKDIV for a bus clock in kHz: the FCCOB controller wants a
+/// ~1 MHz flash clock from the bus clock, FDIV = round(floor(bus/1000 + 0.3999)) - 1
+/// with the result in 800..1600 kHz (ref HCS08-PTxx-flash-scripts.tcl
+/// calculateFlashDivider; it reproduces MC9S08PA60RM Table 4-7 row for row). The
+/// float floor is exact in integers for integer kHz. null below 1 MHz or off-table.
+pub fn s08pFlashDivider(bus_khz: u32) ?u8 {
+    if (bus_khz < 1000) return null;
+    const div = (bus_khz + 399) / 1000 - 1;
+    if (div > 0x3F) return null;
+    const fclk = bus_khz / (div + 1);
+    if (fclk < 800 or fclk > 1600) return null;
+    return @intCast(div);
+}
+
 /// FCDIV is a 6-bit divider plus PRDIV8; the flash clock it yields for `bus_khz`.
 pub fn flashClockKhz(bus_khz: u32, fcdiv: u8) u32 {
     const f = if (fcdiv & 0x40 != 0) bus_khz / 8 else bus_khz;
@@ -350,4 +364,21 @@ test "search reports a target the clock cannot reach" {
     try testing.expectError(error.TrimOutOfRange, search(m.probe(), 2_000_000)); // 2x too fast
     var m2 = ModelProbe{ .f0_hz = 1_000_000 };
     try testing.expectError(error.TrimOutOfRange, search(m2.probe(), 500_000));
+}
+
+test "s08pFlashDivider matches MC9S08PA60RM Table 4-7 at every row boundary" {
+    // (BUSCLK upper bound in kHz, FDIV): each row is (max-1.0 MHz, max].
+    const rows = [_][2]u32{
+        .{ 1600, 0x00 },  .{ 2600, 0x01 },  .{ 3600, 0x02 },  .{ 4600, 0x03 },  .{ 5600, 0x04 },
+        .{ 6600, 0x05 },  .{ 7600, 0x06 },  .{ 8600, 0x07 },  .{ 9600, 0x08 },  .{ 10600, 0x09 },
+        .{ 11600, 0x0A }, .{ 12600, 0x0B }, .{ 13600, 0x0C }, .{ 14600, 0x0D }, .{ 15600, 0x0E },
+        .{ 16600, 0x0F }, .{ 17600, 0x10 }, .{ 18600, 0x11 }, .{ 19600, 0x12 }, .{ 20000, 0x13 },
+    };
+    for (rows, 0..) |r, i| {
+        try std.testing.expectEqual(@as(?u8, @intCast(r[1])), s08pFlashDivider(r[0]));
+        // Just above the previous row's max is this row too.
+        if (i > 0) try std.testing.expectEqual(@as(?u8, @intCast(r[1])), s08pFlashDivider(rows[i - 1][0] + 1));
+    }
+    try std.testing.expectEqual(@as(?u8, 0), s08pFlashDivider(1000));
+    try std.testing.expectEqual(@as(?u8, null), s08pFlashDivider(999)); // < 1 MHz: no programming
 }

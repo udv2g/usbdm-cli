@@ -9,19 +9,40 @@ pub const Family = enum { hcs08, hcs12, cfv1 };
 /// HCS12 routine: classic S12 = MMCV4/FTS, S12G = GMMC/FTMRG, S12XE = XMMC/XFTMRK.
 pub const Hcs12Routine = enum { mmcv4_fts, gmmc_ftmrg, xmmc_xftmrk };
 
+/// HCS08 routine. `classic` = the 0x18xx-map parts (FCMD controller, small-code
+/// blob at 0x80/0xB0). The S08P parts (PA/PT/PL/PB, the device DB's "HCS08Plus")
+/// have a register map at 0x30xx and an FCCOB command-queue controller (FTMRE-like,
+/// at 0x3020): `s08p_small` = PA2/PA4's small-code routine, `s08p_ptxx` = the
+/// large-code routine for PA8..PA60/PT/PL (flash + EEPROM), `s08p_pbxx` = PB's.
+pub const Hcs08Routine = enum {
+    classic,
+    s08p_small,
+    s08p_ptxx,
+    s08p_pbxx,
+
+    pub fn isS08p(self: Hcs08Routine) bool {
+        return self != .classic;
+    }
+};
+
 /// PPAGE-banked HCS12 flash. Window always 0x8000-0xBFFF; pages
 /// page_first..page_last map globally as (page << 16) | offset (routine sets
 /// PPAGE).
 pub const Paged = struct { ppage_addr: u16, page_first: u8, page_last: u8 };
 
-/// EEPROM/D-flash geometry (only the S12G GMMC/FTMRG family). `base_global` =
-/// global D-flash address (driver sets bit 31 to route to D-flash commands);
-/// `sector` = erase granularity, `align_bytes` = program alignment.
-pub const Eeprom = struct { base_global: u32, size: u32, sector: u32, align_bytes: u32 };
+/// EEPROM/D-flash geometry (S12G GMMC/FTMRG and the S08P PTxx routine).
+/// `base_global` = EEPROM address as the routine takes it; `addr_flag` is OR'd in
+/// to route it to the EEPROM commands (S12G: bit 31 "linear" global; S08P: bit 30
+/// ADDRESS_EEPROM). `sector` = erase granularity, `align_bytes` = program alignment.
+pub const Eeprom = struct { base_global: u32, size: u32, sector: u32, align_bytes: u32, addr_flag: u32 = eeprom_linear_flag };
 
 /// OR'd into an EEPROM address so GMMC treats it as a global "linear" address
 /// (-> D-flash commands 0x11/0x12, not PPAGE/P-flash).
 pub const eeprom_linear_flag: u32 = 0x8000_0000;
+
+/// OR'd into an S08P EEPROM address (PTxx routine ADDRESS_EEPROM): the routine then
+/// uses the EEPROM program/erase commands (0x11/0x12) on the low 16 bits.
+pub const s08p_eeprom_flag: u32 = 0x4000_0000;
 
 /// Internal clock generator, from the device DB's `<clock type=..>`. Decides how
 /// the target clock is configured for flash programming and trimmed (clock.zig).
@@ -95,7 +116,13 @@ pub const Device = struct {
     clock_addr: u32 = 0,
     /// SOPT1 (COP control). HCS08 flash operations write it first, as the
     /// reference scripts do, since a running COP resets the part mid-erase.
+    /// 0 on S08P parts: their device-DB "soptAddress" (0x3030) is WDOG_CS1, which
+    /// the routines refresh instead (it goes to `watchdog_addr`).
     sopt_addr: u32 = 0,
+    /// HCS08 routine blob and flash controller kind (ignored for HCS12/CFV1).
+    hcs08_routine: Hcs08Routine = .classic,
+    /// HCS08 SBDFR (BDM system reset register) the pod writes for a software reset.
+    sbdfr_addr: u32 = 0x1801,
 
     pub fn flashLen(self: Device) u32 {
         if (self.paged) |p| return (@as(u32, p.page_last - p.page_first) + 1) * 0x4000;

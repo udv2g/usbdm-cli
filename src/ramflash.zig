@@ -63,6 +63,7 @@ pub const Error = error{
     NoRamForData, // maxDataSize < 40
     Timeout,
     RoutineError, // non-OK DriverError; see last_error
+    CodeDownloadFailed, // routine image read back wrong twice
 } || anyerror;
 
 /// Parsed HCS08 small-code routine blob.
@@ -79,16 +80,18 @@ pub const Routine = struct {
 
     /// [start,end) image offsets of `op`'s code slice. Zero end -> end-of-image;
     /// zero start -> op absent/unsupported (see `hasOp`). Ref loadSmallTargetProgram.
-    pub fn slice(self: Routine, op: Op) struct { start: u8, end: u8 } {
-        const size: u8 = @intCast(self.image.len);
-        const raw_end: u8 = switch (op) {
+    /// The header offsets are bytes, but the last op may run past 255 (S08P PA2/PA4's
+    /// image is 0x18x bytes), so the slice is u32.
+    pub fn slice(self: Routine, op: Op) struct { start: u32, end: u32 } {
+        const size: u32 = @intCast(self.image.len);
+        const raw_end: u32 = switch (op) {
             .program => self.mass_erase,
             .block_erase => self.blank_check,
             .blank_check => self.selective_erase,
             .selective_erase => self.verify,
             .verify => size,
         };
-        const start: u8 = switch (op) {
+        const start: u32 = switch (op) {
             .program => self.program,
             .block_erase => self.mass_erase,
             .blank_check => self.blank_check,
@@ -206,7 +209,7 @@ pub const Driver = struct {
         const data_offset: u32 = r.program; // param area = `program` bytes
         const data_addr = header_addr + data_offset;
 
-        try t.vtable.writeMem(t.ctx, code_load, r.image[s.start..s.end]);
+        try writeCodeVerified(t, code_load, r.image[s.start..s.end]);
 
         // SmallTargetFlashDataHeader: 11 bytes; param area = data_offset >= 11.
         if (data_offset < 11) return error.BadImage;
@@ -262,14 +265,28 @@ pub const Driver = struct {
         if (self.last_error != .ok) return error.RoutineError;
     }
 
-    /// Program `data` at `flash_addr`, chunked.
+    /// Program `data` at `flash_addr`, chunked. With an alignment above 1 (the S08P
+    /// PA2/PA4 routine writes 4-byte phrases and counts its data size down by 4 until
+    /// it hits zero, so anything else runs it away) the span is widened to whole
+    /// units and padded with 0xFF, a no-op on erased flash.
     pub fn program(self: *Driver, flash_addr: u32, data: []const u8) Error!void {
         const max = try self.maxDataSize(.program);
-        const chunk = @min(max, 256); // engine buffer cap
-        var off: usize = 0;
-        while (off < data.len) {
-            const n = @min(data.len - off, chunk);
-            try self.runOnce(.program, flash_addr + @as(u32, @intCast(off)), data[off..][0..n], 0);
+        const alignb: u32 = @max(self.params.alignment, 1);
+        const mask: u32 = alignb - 1;
+        const chunk: u32 = @max(@as(u32, @intCast(@min(max, 256))) & ~mask, alignb); // engine buffer cap
+        const start = flash_addr & ~mask;
+        const data_end: u32 = flash_addr + @as(u32, @intCast(data.len));
+        const total: u32 = ((data_end + mask) & ~mask) - start;
+        var buf: [256]u8 = undefined;
+        var off: u32 = 0;
+        while (off < total) {
+            const n = @min(total - off, chunk);
+            var k: u32 = 0;
+            while (k < n) : (k += 1) {
+                const abs = start + off + k;
+                buf[k] = if (abs >= flash_addr and abs < data_end) data[abs - flash_addr] else 0xFF;
+            }
+            try self.runOnce(.program, start + off, buf[0..n], 0);
             off += n;
         }
     }
@@ -330,8 +347,22 @@ pub const DO_PROGRAM_RANGE: u16 = 1 << 4;
 pub const DO_VERIFY_RANGE: u16 = 1 << 5;
 pub const IS_COMPLETE: u16 = 1 << 15;
 
-/// sizeof(LargeTargetFlashDataHeader).
+pub const CAP_BLANK_CHECK_RANGE: u16 = 1 << 3;
+pub const CAP_VERIFY_RANGE: u16 = 1 << 5;
+
+/// sizeof(LargeTargetFlashDataHeader): HCS12 18 bytes, HCS08 20 (watchdog field).
 const LARGE_HEADER_SIZE: u32 = 18;
+const LARGE_HEADER_SIZE_08: u32 = 20;
+
+/// Which large-code layout a routine uses. Same idea, different field order:
+/// - hcs12: image {loadAddress, entry, capabilities, copctlAddress, calibFactor u32,
+///   flashData}; data {flags, errorCode, controller, frequency, sectorSize, address
+///   u32, dataSize, dataAddress}; result {flags, errorCode}.
+/// - hcs08 (S08P PTxx/PBxx; FlashProgrammer_HCS08.cpp): image {loadAddress, entry,
+///   capabilities, calibFactor u32, flashData}; data {errorCode, flags, controller,
+///   watchdogAddress, frequency, sectorSize, address u32, dataSize, dataAddress};
+///   result {errorCode, flags}.
+pub const LargeAbi = enum { hcs12, hcs08 };
 /// program = blank-check + program + verify in one pass (ref programOperation).
 const LARGE_PROGRAM_OP: u16 = DO_BLANK_CHECK_RANGE | DO_PROGRAM_RANGE | DO_VERIFY_RANGE;
 
@@ -360,7 +391,8 @@ pub const LargeRoutine = struct {
     entry: u32,
     capabilities: u16,
     flash_data: u32, // flashData; data-header addr when CAP_DATA_FIXED
-    header_offset: usize, // offset of the 14-byte image header within `image`
+    header_offset: usize, // offset of the image header within `image`
+    abi: LargeAbi = .hcs12,
 };
 
 /// Parse a 16-bit large-code routine (HCS12). Free via `gpa.free(routine.image)`.
@@ -397,6 +429,71 @@ pub fn parseLarge(gpa: std.mem.Allocator, srec: []const u8) Error!LargeRoutine {
     };
 }
 
+/// Parse an HCS08 large-code routine (S08P PTxx/PBxx): first 2 bytes point at a
+/// 12-byte header {loadAddress, entry, capabilities, calibFactor u32, flashData}.
+/// Free via `gpa.free(routine.image)`.
+pub fn parseLarge08(gpa: std.mem.Allocator, srec: []const u8) Error!LargeRoutine {
+    var img = try hexfile.parse(gpa, srec);
+    errdefer img.deinit(gpa);
+    var code: ?hexfile.Segment = null;
+    for (img.segments) |seg| {
+        if (seg.addr < 0x8000 and (code == null or seg.addr < code.?.addr)) code = seg;
+    }
+    const c = code orelse return error.BadImage;
+    if (c.data.len < 14) return error.BadImage;
+    // A small-code image starts with its flags byte, bit 7 set; a large one with the
+    // header pointer, whose high byte is a RAM page (< 0x80 on these parts).
+    if (c.data[0] & OPT_SMALL_CODE != 0) return error.BadImage;
+    const image_address = c.addr;
+    const header_address = std.mem.readInt(u16, c.data[0..2], .big);
+    if (header_address < image_address) return error.BadImage;
+    const off: usize = header_address - image_address;
+    if (off + 12 > c.data.len) return error.BadImage;
+    const owned = try gpa.dupe(u8, c.data);
+    errdefer gpa.free(owned);
+    if (std.mem.readInt(u16, owned[off..][0..2], .big) != image_address) return error.BadImage;
+    const entry = std.mem.readInt(u16, owned[off + 2 ..][0..2], .big);
+    const capabilities = std.mem.readInt(u16, owned[off + 4 ..][0..2], .big);
+    const flash_data = std.mem.readInt(u16, owned[off + 10 ..][0..2], .big);
+    img.deinit(gpa);
+    return .{
+        .image = owned,
+        .image_address = image_address,
+        .entry = entry,
+        .capabilities = capabilities,
+        .flash_data = flash_data,
+        .header_offset = off,
+        .abi = .hcs08,
+    };
+}
+
+/// Compare flash against `data` by BDM readback (routines without a verify op).
+/// `flash_addr` may carry routing flags above bit 15 on 16-bit targets; callers
+/// strip them.
+/// Download routine code and read it back before anything runs it: a byte that the
+/// BDM link drops or corrupts would otherwise execute as garbage (seen on a busy
+/// bench: the routine ran away into an illegal-address reset). One rewrite, then fail.
+fn writeCodeVerified(t: Target, addr: u32, code: []const u8) Error!void {
+    var attempt: u2 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        try t.vtable.writeMem(t.ctx, addr, code);
+        if (try readbackEqual(t, addr, code)) return;
+    }
+    return error.CodeDownloadFailed;
+}
+
+fn readbackEqual(t: Target, flash_addr: u32, data: []const u8) anyerror!bool {
+    var buf: [256]u8 = undefined;
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = @min(data.len - off, buf.len);
+        try t.vtable.readMem(t.ctx, flash_addr + @as(u32, @intCast(off)), buf[0..n]);
+        if (!std.mem.eql(u8, buf[0..n], data[off..][0..n])) return false;
+        off += n;
+    }
+    return true;
+}
+
 pub const LargeDriver = struct {
     target: Target,
     routine: LargeRoutine,
@@ -405,6 +502,19 @@ pub const LargeDriver = struct {
     code_loaded: bool = false,
 
     const Layout = struct { code_load: u32, entry: u32, data_header: u32, data_addr: u32, max_data: u32 };
+
+    fn headerSize(self: *const LargeDriver) u32 {
+        return switch (self.routine.abi) {
+            .hcs12 => LARGE_HEADER_SIZE,
+            .hcs08 => LARGE_HEADER_SIZE_08,
+        };
+    }
+
+    /// The routine implements `cap` (HCS08 ABI only: those routines advertise what
+    /// they lack, e.g. PBxx has no verify). HCS12 routines are taken as complete.
+    fn has(self: *const LargeDriver, cap: u16) bool {
+        return self.routine.abi == .hcs12 or self.routine.capabilities & cap != 0;
+    }
 
     /// RAM placement (relocation-aware); ref loadLargeTargetProgram.
     fn layout(self: *const LargeDriver) Layout {
@@ -415,7 +525,7 @@ pub const LargeDriver = struct {
         const image_size: u32 = @intCast(self.routine.image.len);
         // data header after code unless CAP_DATA_FIXED
         const data_header: u32 = if (cap & CAP_DATA_FIXED != 0) self.routine.flash_data else code_load + image_size;
-        const data_addr = data_header + LARGE_HEADER_SIZE;
+        const data_addr = data_header + self.headerSize();
         const max_data = if (self.params.ram_end >= data_addr) self.params.ram_end - data_addr + 1 else 0;
         return .{ .code_load = code_load, .entry = self.routine.entry +% delta, .data_header = data_header, .data_addr = data_addr, .max_data = max_data };
     }
@@ -424,33 +534,60 @@ pub const LargeDriver = struct {
     fn loadCode(self: *LargeDriver) Error!void {
         if (self.code_loaded) return;
         const l = self.layout();
+        // The data header and its buffer must fit the RAM the code leaves free.
+        if (l.code_load + self.routine.image.len > self.params.ram_end + 1 or l.max_data == 0)
+            return error.NoRamForData;
         const off = self.routine.header_offset;
         std.mem.writeInt(u16, self.routine.image[off..][0..2], @truncate(l.code_load), .big); // loadAddress
-        std.mem.writeInt(u16, self.routine.image[off + 6 ..][0..2], @truncate(self.params.watchdog_addr), .big); // copctlAddress
-        std.mem.writeInt(u16, self.routine.image[off + 12 ..][0..2], @truncate(l.data_header), .big); // flashData
-        try self.target.vtable.writeMem(self.target.ctx, l.code_load, self.routine.image);
+        switch (self.routine.abi) {
+            .hcs12 => {
+                std.mem.writeInt(u16, self.routine.image[off + 6 ..][0..2], @truncate(self.params.watchdog_addr), .big); // copctlAddress
+                std.mem.writeInt(u16, self.routine.image[off + 12 ..][0..2], @truncate(l.data_header), .big); // flashData
+            },
+            .hcs08 => std.mem.writeInt(u16, self.routine.image[off + 10 ..][0..2], @truncate(l.data_header), .big), // flashData
+        }
+        try writeCodeVerified(self.target, l.code_load, self.routine.image);
         self.code_loaded = true;
     }
 
-    /// Marshal the 18-byte LargeTargetFlashDataHeader + data, run, read ResultStruct { flags@0, errorCode@2 }.
+    /// Marshal the LargeTargetFlashDataHeader (layout per `abi`) + data, run, read
+    /// the ResultStruct.
     fn runOnce(self: *LargeDriver, op_flags: u16, flash_addr: u32, size: u32, data: []const u8) Error!void {
         const t = self.target;
         const l = self.layout();
-        if (LARGE_HEADER_SIZE + data.len > LARGE_HEADER_SIZE + out_buf_size) return error.BadImage;
-        var buf: [LARGE_HEADER_SIZE + out_buf_size]u8 = undefined;
-        @memset(buf[0..LARGE_HEADER_SIZE], 0);
-        // LargeTargetFlashDataHeader: flags@0 errorCode@2 controller@4
-        // frequency@6 sectorSize@8 address@10(u32) dataSize@14 dataAddress@16
-        std.mem.writeInt(u16, buf[0..2], DO_INIT_FLASH | op_flags, .big);
-        std.mem.writeInt(u16, buf[2..4], 0xFFFF, .big); // errorCode sentinel (-1)
-        std.mem.writeInt(u16, buf[4..6], @truncate(self.params.controller), .big);
-        std.mem.writeInt(u16, buf[6..8], self.params.frequency_khz, .big);
-        std.mem.writeInt(u16, buf[8..10], self.params.sector_size, .big);
-        std.mem.writeInt(u32, buf[10..14], flash_addr, .big);
-        std.mem.writeInt(u16, buf[14..16], @intCast(size), .big);
-        std.mem.writeInt(u16, buf[16..18], @truncate(l.data_addr), .big);
-        @memcpy(buf[LARGE_HEADER_SIZE..][0..data.len], data);
-        try t.vtable.writeMem(t.ctx, l.data_header, buf[0 .. LARGE_HEADER_SIZE + data.len]);
+        const hs = self.headerSize();
+        if (data.len > out_buf_size) return error.BadImage;
+        var buf: [LARGE_HEADER_SIZE_08 + out_buf_size]u8 = undefined;
+        @memset(buf[0..hs], 0);
+        switch (self.routine.abi) {
+            .hcs12 => {
+                // flags@0 errorCode@2 controller@4 frequency@6 sectorSize@8
+                // address@10(u32) dataSize@14 dataAddress@16
+                std.mem.writeInt(u16, buf[0..2], DO_INIT_FLASH | op_flags, .big);
+                std.mem.writeInt(u16, buf[2..4], 0xFFFF, .big); // errorCode sentinel (-1)
+                std.mem.writeInt(u16, buf[4..6], @truncate(self.params.controller), .big);
+                std.mem.writeInt(u16, buf[6..8], self.params.frequency_khz, .big);
+                std.mem.writeInt(u16, buf[8..10], self.params.sector_size, .big);
+                std.mem.writeInt(u32, buf[10..14], flash_addr, .big);
+                std.mem.writeInt(u16, buf[14..16], @intCast(size), .big);
+                std.mem.writeInt(u16, buf[16..18], @truncate(l.data_addr), .big);
+            },
+            .hcs08 => {
+                // errorCode@0 flags@2 controller@4 watchdogAddress@6 frequency@8
+                // sectorSize@10 address@12(u32) dataSize@16 dataAddress@18
+                std.mem.writeInt(u16, buf[0..2], 0xFFFF, .big); // errorCode sentinel (-1)
+                std.mem.writeInt(u16, buf[2..4], DO_INIT_FLASH | op_flags, .big);
+                std.mem.writeInt(u16, buf[4..6], @truncate(self.params.controller), .big);
+                std.mem.writeInt(u16, buf[6..8], @truncate(self.params.watchdog_addr), .big);
+                std.mem.writeInt(u16, buf[8..10], self.params.frequency_khz, .big);
+                std.mem.writeInt(u16, buf[10..12], self.params.sector_size, .big);
+                std.mem.writeInt(u32, buf[12..16], flash_addr, .big);
+                std.mem.writeInt(u16, buf[16..18], @intCast(size), .big);
+                std.mem.writeInt(u16, buf[18..20], @truncate(l.data_addr), .big);
+            },
+        }
+        @memcpy(buf[hs..][0..data.len], data);
+        try t.vtable.writeMem(t.ctx, l.data_header, buf[0 .. hs + data.len]);
 
         try t.vtable.writePc(t.ctx, l.entry);
         try t.vtable.go(t.ctx);
@@ -459,8 +596,12 @@ pub const LargeDriver = struct {
 
         var res: [4]u8 = undefined;
         try t.vtable.readMem(t.ctx, l.data_header, &res);
-        const flags = std.mem.readInt(u16, res[0..2], .big);
-        var err = std.mem.readInt(u16, res[2..4], .big);
+        const fi: usize, const ei: usize = switch (self.routine.abi) {
+            .hcs12 => .{ 0, 2 },
+            .hcs08 => .{ 2, 0 },
+        };
+        const flags = std.mem.readInt(u16, res[fi..][0..2], .big);
+        var err = std.mem.readInt(u16, res[ei..][0..2], .big);
         // timeout: sentinel never overwritten -> force timeout
         if (!halted) err = @intFromEnum(DriverError.timeout);
         // success requires IS_COMPLETE set (action bits cleared)
@@ -498,12 +639,24 @@ pub const LargeDriver = struct {
         }
     }
 
-    /// Program: blank-check + program + verify per chunk.
+    /// Program: blank-check + program + verify per chunk (the steps the routine has).
     pub fn program(self: *LargeDriver, flash_addr: u32, data: []const u8) Error!void {
         try self.loadCode();
-        try self.runPadded(LARGE_PROGRAM_OP, flash_addr, data);
+        var op: u16 = LARGE_PROGRAM_OP;
+        if (!self.has(CAP_BLANK_CHECK_RANGE)) op &= ~DO_BLANK_CHECK_RANGE;
+        if (!self.has(CAP_VERIFY_RANGE)) op &= ~DO_VERIFY_RANGE;
+        try self.runPadded(op, flash_addr, data);
     }
     pub fn verify(self: *LargeDriver, flash_addr: u32, data: []const u8) Error!void {
+        if (!self.has(CAP_VERIFY_RANGE)) {
+            // No verify op (PBxx): compare by BDM readback. 16-bit CPU address: the
+            // routing flag (S08P ADDRESS_EEPROM, bit 30) is not part of it.
+            if (!try readbackEqual(self.target, flash_addr & 0xFFFF, data)) {
+                self.last_error = .verify_failed;
+                return error.RoutineError;
+            }
+            return;
+        }
         try self.loadCode();
         try self.runPadded(DO_VERIFY_RANGE, flash_addr, data);
     }
@@ -604,7 +757,7 @@ pub const Cfv1Driver = struct {
         const off = self.routine.header_offset;
         std.mem.writeInt(u32, self.routine.image[off..][0..4], l.code_load, .big); // loadAddress
         std.mem.writeInt(u32, self.routine.image[off + 12 ..][0..4], l.data_header, .big); // flashData
-        try self.target.vtable.writeMem(self.target.ctx, l.code_load, self.routine.image);
+        try writeCodeVerified(self.target, l.code_load, self.routine.image);
         self.code_loaded = true;
     }
 
@@ -706,6 +859,8 @@ const MockTarget = struct {
     cfv1: bool = false, // CFV1 result: flags u32@0, errorCode u16@4; XCSR halt
     result_flags32: u32 = 0, // CFV1 exit flags (CFV1_IS_COMPLETE on success)
     never_halt: bool = false, // never self-halts -> poll timeout
+    corrupt_at: ?u32 = null, // a write covering this address stores it inverted
+    corrupt_writes: u32 = 0, // ...for this many writes
     ran_entry: u32 = 0,
     reconnects: u32 = 0,
 
@@ -718,6 +873,10 @@ const MockTarget = struct {
     fn writeMem(ctx: *anyopaque, addr: u32, data: []const u8) anyerror!void {
         const self: *MockTarget = @ptrCast(@alignCast(ctx));
         for (data, 0..) |b, i| try self.mem.put(addr + @as(u32, @intCast(i)), b);
+        if (self.corrupt_at) |c| if (self.corrupt_writes > 0 and c >= addr and c < addr + data.len) {
+            try self.mem.put(c, ~data[c - addr]);
+            self.corrupt_writes -= 1;
+        };
         // capture header before the routine clobbers bytes 0-1
         if (addr == self.header_addr and data.len >= 11) {
             const n = @min(data.len, self.last_header.len);
@@ -818,10 +977,10 @@ test "slice selection picks the right code range per op" {
     const img = try synthImage(testing.allocator);
     defer testing.allocator.free(img);
     const r = synthRoutine(img);
-    try testing.expectEqual(@as(u8, 12), r.slice(.program).start);
-    try testing.expectEqual(@as(u8, 20), r.slice(.program).end);
-    try testing.expectEqual(@as(u8, 44), r.slice(.verify).start);
-    try testing.expectEqual(@as(u8, 52), r.slice(.verify).end); // == image size
+    try testing.expectEqual(@as(u32, 12), r.slice(.program).start);
+    try testing.expectEqual(@as(u32, 20), r.slice(.program).end);
+    try testing.expectEqual(@as(u32, 44), r.slice(.verify).start);
+    try testing.expectEqual(@as(u32, 52), r.slice(.verify).end); // == image size
 }
 
 test "program marshals the small param block and runs the top-of-RAM slice" {
@@ -897,8 +1056,8 @@ test "slice clamps a zero end offset to image size; hasOp reports absence" {
     img[5] = 0; // verify absent
     const r = synthRoutine(img);
     // selective_erase end = verify(0) -> clamped to image size (60).
-    try testing.expectEqual(@as(u8, 36), r.slice(.selective_erase).start);
-    try testing.expectEqual(@as(u8, 60), r.slice(.selective_erase).end);
+    try testing.expectEqual(@as(u32, 36), r.slice(.selective_erase).start);
+    try testing.expectEqual(@as(u32, 60), r.slice(.selective_erase).end);
     try testing.expect(!r.hasOp(.verify)); // offset 0 -> absent
     try testing.expect(r.hasOp(.program));
 }
@@ -1167,6 +1326,28 @@ test "cfv1 completion requires the 32-bit sentinel, not the 16-bit one" {
     };
     try testing.expectError(error.RoutineError, drv.blankCheck(0x0000, 0x2000));
     try testing.expectEqual(DriverError.unknown, drv.last_error);
+}
+
+test "routine code is read back before it runs: one bad download is rewritten, two fail" {
+    const img = try synthLargeImage(testing.allocator, 0x40);
+    defer testing.allocator.free(img);
+    for ([_]u32{ 1, 2 }) |bad_writes| {
+        var mock = MockTarget.init(testing.allocator);
+        defer mock.deinit();
+        mock.large = true;
+        mock.header_addr = 0x0840;
+        var drv = LargeDriver{ .target = mock.target(), .routine = synthLargeRoutine(img), .params = .{ .ram_start = 0x0800, .ram_end = 0x0FFF, .controller = 0x0100, .sector_size = 512, .frequency_khz = 4000, .poll_iterations = 2 } };
+        mock.corrupt_at = drv.layout().code_load + 3;
+        mock.corrupt_writes = bad_writes;
+        if (bad_writes == 1) {
+            try drv.loadCode();
+            try testing.expectEqual(@as(u32, 0), mock.corrupt_writes);
+            try testing.expectEqual(img[3], mock.mem.get(drv.layout().code_load + 3).?);
+        } else {
+            try testing.expectError(error.CodeDownloadFailed, drv.loadCode());
+            try testing.expect(!drv.code_loaded);
+        }
+    }
 }
 
 test "a routine that never self-halts times out (all three drivers)" {

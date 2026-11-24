@@ -157,19 +157,29 @@ pub const CpuBackend = union(enum) {
 /// This is the BDM clock with CLKSW=1.
 pub const IcsModel = struct {
     base: u32,
-    /// FLL multiplier at DRS=0 (1024 on ICSV2, 512 on ICSV1/V3).
+    /// FLL multiplier at DRS=0 (1024 on ICSV2, 512 on ICSV1/V3/V4).
     fll: f64 = 1024,
     /// Reference at trim 256 (TRIM 0x80, FTRIM 0).
     irc_hz: f64 = 33_700,
     /// Fractional frequency change per trim step.
     slope: f64 = -0.0019,
+    /// BDIV field position in ICSC2: bits 7:6 on ICSV1-3, bits 7:5 on ICSV4/V5.
+    bdiv_shift: u3 = 6,
+    /// Fixed divider after BDIV: /2 on the classic parts, none on S08P (MC9S08PA60RM
+    /// 8.6.2: BDIV "controls the bus frequency").
+    post_div: f64 = 2.0,
+
+    /// An S08P (ICSV4) clock: 31.25 kHz nominal reference x 512, BDIV 3 bits, no /2.
+    pub fn icsV4(base: u32) IcsModel {
+        return .{ .base = base, .fll = 512, .irc_hz = 31_900, .bdiv_shift = 5, .post_div = 1.0 };
+    }
 
     pub fn busHz(self: IcsModel, sim: *Sim) f64 {
         const c2 = sim.memGet(self.base + 1);
         const trim: f64 = @floatFromInt((@as(u32, sim.memGet(self.base + 2)) << 1) | (sim.memGet(self.base + 3) & 1));
-        const bdiv: f64 = @floatFromInt(@as(u32, 1) << @intCast(c2 >> 6));
+        const bdiv: f64 = @floatFromInt(@as(u32, 1) << @intCast(c2 >> self.bdiv_shift));
         const irc = self.irc_hz * (1.0 + self.slope * (trim - 256.0));
-        return irc * self.fll / bdiv / 2.0;
+        return irc * self.fll / bdiv / self.post_div;
     }
 };
 
@@ -237,7 +247,7 @@ pub const Sim = struct {
 
     /// Device's own SDID at its family SDID address; an explicit write overrides it.
     fn sdidByte(self: *Sim, a: u32) ?u8 {
-        const addr = device.familySdidAddr(self.dev.family);
+        const addr = device.sdidAddrFor(self.dev);
         if (a != addr and a != addr +% 1) return null;
         for (device.sdid_table) |e| {
             if (e.family == self.dev.family and std.ascii.eqlIgnoreCase(e.name, self.dev.name)) {

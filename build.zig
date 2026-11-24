@@ -84,6 +84,17 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("flash_hcs08_0xB0", .{
         .root_source_file = b.path("vendor/flash-routines/HCS08-default-0xB0-flash-program.s19"),
     });
+    // S08P (PA/PT/PL/PB): FCCOB controller at 0x3020. PAxx-small = PA2/PA4 small
+    // code; PTxx/PBxx = large code with the HCS08 header layout.
+    exe.root_module.addAnonymousImport("flash_s08p_small", .{
+        .root_source_file = b.path("vendor/flash-routines/HCS08-PAxx-small-flash-program.s19"),
+    });
+    exe.root_module.addAnonymousImport("flash_s08p_ptxx", .{
+        .root_source_file = b.path("vendor/flash-routines/HCS08-PTxx-flash-program.s19"),
+    });
+    exe.root_module.addAnonymousImport("flash_s08p_pbxx", .{
+        .root_source_file = b.path("vendor/flash-routines/HCS08-PBxx-flash-program.s19"),
+    });
     exe.root_module.addAnonymousImport("flash_hcs12_fts", .{
         .root_source_file = b.path("vendor/flash-routines/HCS12-MMCV4-FTS-flash-program.s19"),
     });
